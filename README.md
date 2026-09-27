@@ -23,8 +23,8 @@ SUPERADMIN_EMAIL="..." SUPERADMIN_INITIAL_PASSWORD="..." \
   AFFILIATE_DB="/path/ke/affiliate.sqlite3" python3 app.py --bootstrap-admin
 ```
 
-Dashboard menyediakan logout dan tema Sistem/Terang/Gelap. Pembuatan job terkunci
-sampai password bootstrap diganti.
+Dashboard menyediakan logout, tema Sistem/Terang/Gelap, dan tombol Edit password.
+Pembuatan job terkunci sampai password bootstrap diganti.
 
 Pada macOS worker dijalankan mandiri oleh LaunchAgent `com.fahra.aff-rotator`, sehingga tidak perlu menjalankan `./start.sh` setiap kali. Jika perintah itu dijalankan saat service sudah aktif, script hanya menampilkan alamat service lalu selesai.
 

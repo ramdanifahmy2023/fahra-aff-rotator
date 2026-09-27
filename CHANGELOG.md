@@ -48,3 +48,6 @@
   target sentuh minimum, grid satu kolom, dan fokus keyboard yang tetap terlihat.
 - Menambahkan halaman login superadmin, panel wajib ganti password awal, logout, dan
   pemilih tema Sistem/Terang/Gelap yang tersimpan di browser.
+- Menambahkan tombol Edit password di dashboard dengan konfirmasi password baru;
+  panel tetap tersedia setelah bootstrap selesai dan session lain dicabut saat
+  password berhasil diubah.

@@ -798,12 +798,16 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.read_json()
                 current_password = str(body.get("current_password", "")) if isinstance(body, dict) else ""
                 new_password = validate_password(body.get("new_password") if isinstance(body, dict) else "")
+                confirmation = str(body.get("new_password_confirmation", "")) if isinstance(body, dict) else ""
+                if not hmac.compare_digest(new_password, confirmation):
+                    raise ValueError("Konfirmasi password baru tidak cocok")
                 with db() as conn:
                     stored = conn.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
                     if not stored or not verify_password(current_password, stored["password_hash"]):
                         self.send_json({"error": "Password saat ini salah"}, HTTPStatus.UNAUTHORIZED)
                         return
                     conn.execute("UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?", (password_hash(new_password), now(), user["id"]))
+                    conn.execute("UPDATE sessions SET revoked_at=? WHERE user_id=? AND id<>? AND revoked_at IS NULL", (now(), user["id"], user["session_id"]))
                 self.send_json({"ok": True, "must_change_password": False})
             except (ValueError, json.JSONDecodeError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -977,9 +981,9 @@ INDEX_HTML = r'''<!doctype html>
 <main>
   <header>
     <div><h1>Buat link yang <span style="color:var(--accent)">bekerja.</span></h1><p class="dek">Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.</p></div>
-    <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="logout" type="button">Keluar</button></div></div>
+  <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="password-toggle" type="button">Edit password</button><button id="logout" type="button">Keluar</button></div></div>
   </header>
-  <section id="password-panel" class="password-panel" hidden aria-labelledby="password-title"><h2 id="password-title">Ganti password awal</h2><p class="hint">Untuk keamanan, ganti password bootstrap sebelum membuat job.</p><form id="password-form"><label for="current-password">Password saat ini</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Password baru</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required><button type="submit">Simpan password baru</button><p id="password-message" class="hint" role="status"></p></form></section>
+  <section id="password-panel" class="password-panel" hidden aria-labelledby="password-title"><h2 id="password-title">Ganti password</h2><p id="password-hint" class="hint">Masukkan password saat ini dan password baru.</p><form id="password-form"><label for="current-password">Password saat ini</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Password baru</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required><label for="new-password-confirmation">Ulangi password baru</label><input id="new-password-confirmation" type="password" autocomplete="new-password" minlength="12" required><button type="submit">Simpan password</button><p id="password-message" class="hint" role="status"></p></form></section>
   <div class="layout">
     <section aria-labelledby="create-title">
       <h2 id="create-title">Buat batch link</h2>
@@ -1013,6 +1017,7 @@ const JOBS_PER_PAGE = 5;
 let jobsCache = [];
 let currentPage = 1;
 let currentUser = null;
+let passwordPanelOpen = false;
 function applyTheme(value) {
   localStorage.setItem('fahra-theme', value);
   document.documentElement.dataset.theme = value === 'system' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : value;
@@ -1028,7 +1033,9 @@ async function api(url, options = {}) {
 }
 function updatePasswordLock() {
   const locked = Boolean(currentUser?.must_change_password);
-  $('#password-panel').hidden = !locked;
+  $('#password-panel').hidden = !locked && !passwordPanelOpen;
+  $('#password-toggle').textContent = passwordPanelOpen || locked ? 'Tutup password' : 'Edit password';
+  $('#password-hint').textContent = locked ? 'Untuk keamanan, ganti password bootstrap sebelum membuat job.' : 'Masukkan password saat ini dan password baru.';
   $('#job-form').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = locked; });
   if (locked) $('#form-message').textContent = 'Ganti password awal di atas untuk membuka pembuatan job.';
 }
@@ -1106,6 +1113,7 @@ async function refresh() {
 }
 $('#theme-select').addEventListener('change', () => applyTheme($('#theme-select').value));
 applyTheme(localStorage.getItem('fahra-theme') || 'system');
+$('#password-toggle').addEventListener('click', () => { passwordPanelOpen = !passwordPanelOpen; updatePasswordLock(); if (passwordPanelOpen || currentUser?.must_change_password) $('#current-password').focus(); });
 $('#logout').addEventListener('click', async () => { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); location.href = '/login'; });
 $('#password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -1113,9 +1121,10 @@ $('#password-form').addEventListener('submit', async (event) => {
   const message = $('#password-message');
   button.disabled = true; message.textContent = '';
   try {
-    await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password: $('#current-password').value, new_password: $('#new-password').value }) });
-    $('#current-password').value = ''; $('#new-password').value = '';
+    await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password: $('#current-password').value, new_password: $('#new-password').value, new_password_confirmation: $('#new-password-confirmation').value }) });
+    $('#current-password').value = ''; $('#new-password').value = ''; $('#new-password-confirmation').value = '';
     message.textContent = 'Password tersimpan. Pembuatan job sudah dibuka.';
+    passwordPanelOpen = false;
     await refresh();
   } catch (error) { message.textContent = error.message; } finally { button.disabled = false; }
 });

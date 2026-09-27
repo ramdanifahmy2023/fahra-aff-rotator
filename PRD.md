@@ -110,6 +110,8 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
   untuk webapp dan extension bridge, dengan rate limit login dan password bootstrap
   yang wajib diganti.
 - Dashboard menyediakan pemilih tema sistem/terang/gelap dan layout mobile friendly.
+- Superadmin dapat mengedit password kapan saja dengan verifikasi password saat ini,
+  konfirmasi password baru, dan pencabutan session lain setelah berhasil.
 
 ## Keamanan dan privasi
 

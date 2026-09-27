@@ -95,8 +95,10 @@ SUPERADMIN_EMAIL="..." SUPERADMIN_INITIAL_PASSWORD="..." \
 ```
 
 Endpoint auth tambahan: `GET /api/auth/me`, `POST /api/auth/logout`, dan
-`POST /api/auth/change-password` dengan body `current_password` dan
-`new_password`. Password baru minimal 12 karakter.
+`POST /api/auth/change-password` dengan body `current_password`, `new_password`,
+dan `new_password_confirmation`. Password baru minimal 12 karakter. Endpoint ini
+tersedia untuk edit password kapan saja dari dashboard; saat password bootstrap
+belum diganti, panelnya otomatis terbuka dan job dikunci.
 
 Membuat job:
 
