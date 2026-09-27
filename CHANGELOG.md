@@ -21,3 +21,8 @@
   log runtime, cache Python, dan `node_modules`.
 - Mengubah `.env.example` menjadi portable dengan path relatif; credential tetap hanya
   berada di mesin lokal.
+
+### UI
+
+- Memperkuat layout webapp pada viewport tablet dan mobile, termasuk wrapping URL/job,
+  target sentuh minimum, grid satu kolom, dan fokus keyboard yang tetap terlihat.
