@@ -56,6 +56,8 @@
 
 ### UI
 
+- Menambahkan favicon web berbasis simbol chain-link dengan palet dark warm,
+  krem, oranye, dan coral yang konsisten dengan sidebar serta extension.
 - Menambahkan blok Hasil terbaru di Dashboard yang menampilkan lima job terakhir beserta short link siap salin; halaman Riwayat tetap menjadi arsip lengkap.
 - Memperbaiki mode sidebar ikon agar label menu Dashboard, MCP, Pengaturan, dan Riwayat benar-benar tersembunyi secara visual saat sidebar diperkecil, sementara nama aksesibilitas tetap tersedia.
 - Memperbaiki sidebar yang dapat terbuka dalam mode ikon akibat preferensi lama; state collapse kini memakai kunci versi baru dan dashboard kembali expanded pada migrasi pertama.

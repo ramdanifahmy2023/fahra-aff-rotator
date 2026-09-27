@@ -1264,6 +1264,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/favicon.svg":
+            self.send_svg(FAVICON_SVG)
+            return
         if parsed.path == "/login":
             if current_user(self, touch=False):
                 self.send_redirect("/")
@@ -1473,11 +1476,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_svg(self, svg: str) -> None:
+        raw = svg.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/svg+xml")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+FAVICON_SVG = r'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#1a1714"/>
+  <rect x="5" y="5" width="118" height="118" rx="24" fill="none" stroke="#3a2c23" stroke-width="2"/>
+  <path d="M54 44 42 56a19 19 0 0 0 27 27l12-12" fill="none" stroke="#f5efe4" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m74 84 12-12a19 19 0 0 0-27-27L47 57" fill="none" stroke="#e98425" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m52 67 24-6" fill="none" stroke="#ff6b3d" stroke-width="7" stroke-linecap="round"/>
+</svg>'''
+
 
 LOGIN_HTML = r'''<!doctype html>
 <html lang="id">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Masuk · Fahra Affiliate Rotator</title>
   <script>const storedTheme=localStorage.getItem('fahra-theme');const savedTheme=['system','light','dark'].includes(storedTheme)?storedTheme:'system';document.documentElement.dataset.theme=savedTheme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):savedTheme;</script>
   <style>
@@ -1498,6 +1520,7 @@ INDEX_HTML = r'''<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <title>Link khusus Shopee</title>
   <script>const storedTheme=localStorage.getItem('fahra-theme');const savedTheme=['system','light','dark'].includes(storedTheme)?storedTheme:'system';document.documentElement.dataset.theme=savedTheme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):savedTheme;</script>
   <style>
