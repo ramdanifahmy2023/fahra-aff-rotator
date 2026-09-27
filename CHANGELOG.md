@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Menambahkan ikon extension Fahra Affiliate Bridge dengan simbol chain-link
+  beraksen oranye yang selaras dengan tema webapp, lengkap untuk ukuran Chrome 16px
+  sampai 128px.
 - Memperbaiki parser hasil batch extension agar beberapa short link yang berada
   dalam satu textarea modal Shopee diekstrak satu per satu, sehingga batch 3 URL
   tidak lagi menunggu sampai timeout 60 detik.
