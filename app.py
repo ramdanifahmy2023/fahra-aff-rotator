@@ -641,8 +641,17 @@ INDEX_HTML = r'''<!doctype html>
     .result { min-width:0; margin-top:9px; display:grid; gap:6px; }
     .result > div { min-width:0; }
     .result a { display:inline-block; max-width:100%; color:var(--accent); overflow-wrap:anywhere; }
+    .result a.copied { color:#207044; }
+    .copy-feedback { color:#207044; font-size:.8rem; margin-left:6px; }
     .error { color:var(--error); font-size:.9rem; }
     .empty { color:var(--muted); padding:22px 0; }
+    .pagination { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:17px; }
+    .pagination-list { display:flex; min-width:0; flex:1 1 auto; justify-content:center; flex-wrap:wrap; gap:6px; }
+    .pagination button { min-width:44px; min-height:44px; margin:0; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--ink); padding:9px 11px; }
+    .pagination button:hover { background:#f3eee6; }
+    .pagination button[aria-current="page"] { background:var(--ink); color:var(--light); }
+    .pagination button:disabled { opacity:.4; cursor:not-allowed; }
+    .pagination .pagination-control { white-space:nowrap; }
     @media (max-width: 860px) {
       main { width:min(100% - 32px, 680px); margin-top:24px; margin-bottom:48px; }
       header { display:block; margin-bottom:26px; }
@@ -659,6 +668,10 @@ INDEX_HTML = r'''<!doctype html>
       textarea { min-height:132px; }
       .tags { grid-template-columns:repeat(2,minmax(0,1fr)); }
       button { width:100%; margin-top:16px; }
+      .pagination { flex-wrap:wrap; }
+      .pagination button { width:auto; margin-top:0; }
+      .pagination .pagination-control { flex:1 1 calc(50% - 5px); }
+      .pagination-list { order:3; flex-basis:100%; }
     }
     @media (max-width: 380px) {
       main { width:calc(100% - 20px); }
@@ -698,11 +711,15 @@ INDEX_HTML = r'''<!doctype html>
     <section aria-labelledby="jobs-title">
       <h2 id="jobs-title">Job terakhir</h2>
       <div id="jobs" class="jobs"><p class="empty">Belum ada job.</p></div>
+      <nav id="jobs-pagination" class="pagination" aria-label="Navigasi riwayat job"></nav>
     </section>
   </div>
 </main>
 <script>
 const $ = (s) => document.querySelector(s);
+const JOBS_PER_PAGE = 5;
+let jobsCache = [];
+let currentPage = 1;
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function sourceLabel(value) {
   try {
@@ -713,15 +730,76 @@ function sourceLabel(value) {
   }
 }
 function renderJob(job) {
-  const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div><span>${i + 1}. </span><a href="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer">${escapeHtml(row.shortLink)}</a></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
+  const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div><span>${i + 1}. </span><a class="copy-link" href="${escapeHtml(row.shortLink)}" data-copy="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer" aria-label="Salin short link ${escapeHtml(row.shortLink)}">${escapeHtml(row.shortLink)}</a><span class="copy-feedback" role="status" aria-live="polite"></span></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
   const source = String(job.links?.[0] || '');
   return `<article class="job"><div class="job-head"><div><a class="job-source" href="${escapeHtml(source)}" target="_blank" rel="noreferrer" title="${escapeHtml(source)}" aria-label="Buka URL sumber: ${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</a><div class="job-id">${escapeHtml(job.id)}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
+}
+function renderPagination() {
+  const pagination = $('#jobs-pagination');
+  const pageCount = Math.ceil(jobsCache.length / JOBS_PER_PAGE);
+  if (pageCount <= 1) { pagination.innerHTML = ''; return; }
+  const pages = Array.from({length: pageCount}, (_, i) => i + 1).map(page => `<button type="button" data-page="${page}"${page === currentPage ? ' aria-current="page"' : ''} aria-label="Halaman ${page}">${page}</button>`).join('');
+  pagination.innerHTML = `<button class="pagination-control" type="button" data-page="${currentPage - 1}"${currentPage === 1 ? ' disabled' : ''}>Sebelumnya</button><div class="pagination-list">${pages}</div><button class="pagination-control" type="button" data-page="${currentPage + 1}"${currentPage === pageCount ? ' disabled' : ''}>Berikutnya</button>`;
+}
+function renderJobs() {
+  const pageCount = Math.ceil(jobsCache.length / JOBS_PER_PAGE);
+  currentPage = Math.min(Math.max(currentPage, 1), Math.max(pageCount, 1));
+  const start = (currentPage - 1) * JOBS_PER_PAGE;
+  const visibleJobs = jobsCache.slice(start, start + JOBS_PER_PAGE);
+  $('#jobs').innerHTML = visibleJobs.length ? visibleJobs.map(renderJob).join('') : '<p class="empty">Belum ada job. Kirim URL pertama untuk memulai.</p>';
+  renderPagination();
+}
+async function copyText(value) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (_) {}
+  const helper = document.createElement('textarea');
+  helper.value = value;
+  helper.setAttribute('readonly', '');
+  helper.style.position = 'fixed';
+  helper.style.opacity = '0';
+  document.body.appendChild(helper);
+  try {
+    helper.select();
+    return document.execCommand('copy');
+  } catch (_) {
+    return false;
+  } finally {
+    helper.remove();
+  }
+}
+function showCopyFeedback(link, message, copied) {
+  const feedback = link.parentElement.querySelector('.copy-feedback');
+  if (feedback) feedback.textContent = message;
+  link.classList.toggle('copied', copied);
+  window.clearTimeout(link.copyFeedbackTimer);
+  link.copyFeedbackTimer = window.setTimeout(() => {
+    if (feedback) feedback.textContent = '';
+    link.classList.remove('copied');
+  }, 2200);
 }
 async function refresh() {
   const [health, jobs] = await Promise.all([fetch('/api/health').then(r => r.json()), fetch('/api/jobs').then(r => r.json())]);
   $('#health').textContent = health.worker ? (health.bridge?.connected ? 'Bridge aktif' : 'Menunggu extension') : 'Worker berhenti';
-  $('#jobs').innerHTML = jobs.jobs.length ? jobs.jobs.map(renderJob).join('') : '<p class="empty">Belum ada job. Kirim URL pertama untuk memulai.</p>';
+  jobsCache = Array.isArray(jobs.jobs) ? jobs.jobs : [];
+  renderJobs();
 }
+$('#jobs-pagination').addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-page]');
+  if (!button || button.disabled) return;
+  currentPage = Number(button.dataset.page);
+  renderJobs();
+});
+$('#jobs').addEventListener('click', async (event) => {
+  const link = event.target.closest('a.copy-link');
+  if (!link) return;
+  event.preventDefault();
+  const copied = await copyText(link.dataset.copy || link.textContent.trim());
+  showCopyFeedback(link, copied ? 'Link tersalin' : 'Salin manual dari link ini', copied);
+});
 $('#job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const button = $('#submit'); button.disabled = true; $('#form-message').textContent = 'Menyimpan job...';
   const tags = [1,2,3,4,5].map(i => event.target.elements[`tag${i}`].value.trim());

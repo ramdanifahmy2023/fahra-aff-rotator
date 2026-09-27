@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Membatasi riwayat job menjadi lima item per halaman dengan navigasi responsif,
+  serta menambahkan salin otomatis untuk short link hasil dengan notifikasi status.
 - Memadatkan URL sumber pada kartu `Job terakhir` menjadi label path maksimal dua
   baris, sambil mempertahankan URL lengkap sebagai link yang dapat dibuka agar daftar
   job tidak melebar atau membengkak di viewport sempit.
