@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Memperbaiki parser hasil batch extension agar beberapa short link yang berada
+  dalam satu textarea modal Shopee diekstrak satu per satu, sehingga batch 3 URL
+  tidak lagi menunggu sampai timeout 60 detik.
 - Membatasi riwayat job menjadi lima item per halaman dengan navigasi responsif,
   serta menambahkan salin otomatis untuk short link hasil dengan notifikasi status.
 - Memadatkan URL sumber pada kartu `Job terakhir` menjadi label path maksimal dua

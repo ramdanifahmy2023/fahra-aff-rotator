@@ -4,13 +4,20 @@ function visible(element) {
   return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
 }
 
+const SHORT_LINK_PATTERN = /https:\/\/s\.shopee\.co\.id\/[A-Za-z0-9]+/g;
+
+function extractShortLinks(value) {
+  return String(value || '').match(SHORT_LINK_PATTERN) || [];
+}
+
 function shortLinks() {
   const values = [...document.querySelectorAll('input, textarea')]
     .filter(visible)
-    .map(input => input.value)
-    .filter(value => /^https:\/\/s\.shopee\.co\.id\//.test(value));
-  const textMatches = document.body.innerText.match(/https:\/\/s\.shopee\.co\.id\/[A-Za-z0-9]+/g) || [];
-  return [...new Set([...values, ...textMatches])];
+    .flatMap(input => extractShortLinks(input.value));
+  const textMatches = extractShortLinks(document.body.innerText);
+  const hrefMatches = [...document.querySelectorAll('a[href]')]
+    .flatMap(link => extractShortLinks(link.href));
+  return [...new Set([...values, ...textMatches, ...hrefMatches])];
 }
 
 function resultModalVisible() {
