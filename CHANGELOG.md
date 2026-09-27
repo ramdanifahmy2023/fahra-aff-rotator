@@ -31,6 +31,12 @@
 
 ### Security
 
+- Menambahkan autentikasi superadmin berbasis session cookie HttpOnly, hash password
+  scrypt, rate limit login, bootstrap admin satu kali, dan proteksi API job/bridge.
+- Menghapus kebocoran path database dari endpoint health dan mengganti CORS wildcard
+  bridge dengan origin extension yang direfleksikan bersama credential.
+- Memperketat validasi hostname agar domain mirip `shopee.co.id` tidak lolos.
+
 - Menambahkan ignore rules untuk `.env`, cookie, header sesi, database, profile browser,
   log runtime, cache Python, dan `node_modules`.
 - Mengubah `.env.example` menjadi portable dengan path relatif; credential tetap hanya
@@ -40,3 +46,5 @@
 
 - Memperkuat layout webapp pada viewport tablet dan mobile, termasuk wrapping URL/job,
   target sentuh minimum, grid satu kolom, dan fokus keyboard yang tetap terlihat.
+- Menambahkan halaman login superadmin, panel wajib ganti password awal, logout, dan
+  pemilih tema Sistem/Terang/Gelap yang tersimpan di browser.

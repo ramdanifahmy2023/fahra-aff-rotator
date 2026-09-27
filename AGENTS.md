@@ -110,3 +110,17 @@ sebagai persistence sampai row database berubah.
 - Mode `SHOPEE_TRANSPORT=http` hanya untuk diagnosis dan bisa terkena anti-bot.
 - Mode multi-device atau public deployment belum menjadi bagian dari runtime aman;
   jangan mengekspos port lokal tanpa desain autentikasi dan TLS.
+
+## Auth dan UI yang sudah diterapkan
+
+- Webapp memiliki satu role `superadmin` dan session cookie HttpOnly yang disimpan
+  sebagai hash di SQLite. API job dan semua endpoint bridge memerlukan session.
+- Bootstrap admin dijalankan sekali dengan environment sementara:
+  `SUPERADMIN_EMAIL=... SUPERADMIN_INITIAL_PASSWORD=... python3 app.py --bootstrap-admin`.
+  Password awal wajib diganti dari panel dashboard; nilainya tidak boleh ditulis ke
+  source, docs, log, atau commit.
+- Origin bridge hanya direfleksikan untuk origin extension Chrome yang meminta
+  credential. Wildcard CORS tidak digunakan.
+- Dashboard dan halaman login mendukung tema Sistem, Terang, dan Gelap, dengan
+  layout responsif untuk mobile. Setelah mengubah file extension, reload extension
+  dan tab Custom Link agar worker memakai `credentials: include` terbaru.

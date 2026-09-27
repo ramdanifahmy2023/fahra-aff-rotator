@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -13,6 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +53,12 @@ USER_AGENT = os.getenv(
 )
 TRANSPORT = os.getenv("SHOPEE_TRANSPORT", "extension").lower()
 BRIDGE_WAIT_SECONDS = float(os.getenv("SHOPEE_BRIDGE_WAIT_SECONDS", "180"))
+AUTH_COOKIE_NAME = "fahra_session"
+AUTH_SESSION_TTL = max(900, int(os.getenv("AUTH_SESSION_TTL_SECONDS", "86400")))
+AUTH_EMAIL = os.getenv("SUPERADMIN_EMAIL", "ramdanifahmy2023@gmail.com").strip().lower()
+PASSWORD_MIN_LENGTH = 12
+AUTH_RATE_LIMIT: dict[str, list[float]] = {}
+AUTH_RATE_LOCK = threading.Lock()
 
 GRAPHQL_QUERY = """
     query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){
@@ -74,6 +83,28 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'superadmin' CHECK(role='superadmin'),
+  password_hash TEXT NOT NULL,
+  must_change_password INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_login_at TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS sessions_token_hash ON sessions(token_hash);
+CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
 """
 
 
@@ -110,6 +141,127 @@ def init_db() -> None:
 
 def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def future_time(seconds: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds))
+
+
+def normalize_email(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def validate_password(value: Any) -> str:
+    password = str(value or "")
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"Password minimal {PASSWORD_MIN_LENGTH} karakter")
+    if len(password) > 256:
+        raise ValueError("Password terlalu panjang")
+    return password
+
+
+def password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=64)
+    return "scrypt$16384$8$1${}${}".format(salt.hex(), digest.hex())
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        scheme, raw_n, raw_r, raw_p, raw_salt, raw_digest = encoded.split("$", 5)
+        if scheme != "scrypt":
+            return False
+        digest = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=bytes.fromhex(raw_salt),
+            n=int(raw_n),
+            r=int(raw_r),
+            p=int(raw_p),
+            dklen=len(bytes.fromhex(raw_digest)),
+        )
+        return hmac.compare_digest(digest.hex(), raw_digest)
+    except (ValueError, TypeError):
+        return False
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def bootstrap_admin() -> None:
+    email = normalize_email(os.getenv("SUPERADMIN_EMAIL", AUTH_EMAIL))
+    password = validate_password(os.getenv("SUPERADMIN_INITIAL_PASSWORD", ""))
+    if not email or "@" not in email:
+        raise RuntimeError("SUPERADMIN_EMAIL tidak valid")
+    with db() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE users SET role='superadmin', password_hash=?, must_change_password=1, updated_at=? WHERE id=?",
+                (password_hash(password), now(), existing["id"]),
+            )
+            conn.execute("UPDATE sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", (now(), existing["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO users(email,role,password_hash,must_change_password) VALUES(?,?,?,1)",
+                (email, "superadmin", password_hash(password)),
+            )
+    print(f"Superadmin siap: {email}")
+
+
+def parse_session_token(cookie_header: str) -> str | None:
+    cookies = SimpleCookie()
+    try:
+        cookies.load(cookie_header or "")
+    except Exception:
+        return None
+    morsel = cookies.get(AUTH_COOKIE_NAME)
+    return morsel.value if morsel else None
+
+
+def current_user(handler: "Handler", *, touch: bool = True) -> sqlite3.Row | None:
+    token = parse_session_token(handler.headers.get("Cookie", ""))
+    if not token:
+        return None
+    with db() as conn:
+        row = conn.execute(
+            """SELECT u.id, u.email, u.role, u.must_change_password, s.id AS session_id
+               FROM sessions s JOIN users u ON u.id=s.user_id
+               WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>?""",
+            (token_hash(token), now()),
+        ).fetchone()
+        if row and touch:
+            conn.execute("UPDATE sessions SET last_seen=? WHERE id=?", (now(), row["session_id"]))
+    return row
+
+
+def create_session(user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    current = now()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO sessions(token_hash,user_id,created_at,last_seen,expires_at) VALUES(?,?,?,?,?)",
+            (token_hash(token), user_id, current, current, future_time(AUTH_SESSION_TTL)),
+        )
+        conn.execute("UPDATE users SET last_login_at=?, updated_at=? WHERE id=?", (current, current, user_id))
+    return token
+
+
+def revoke_session(handler: "Handler") -> None:
+    token = parse_session_token(handler.headers.get("Cookie", ""))
+    if token:
+        with db() as conn:
+            conn.execute("UPDATE sessions SET revoked_at=? WHERE token_hash=?", (now(), token_hash(token)))
+
+
+def login_rate_limited(key: str) -> bool:
+    current = time.time()
+    with AUTH_RATE_LOCK:
+        recent = [stamp for stamp in AUTH_RATE_LIMIT.get(key, []) if current - stamp < 60]
+        limited = len(recent) >= 8
+        recent.append(current)
+        AUTH_RATE_LIMIT[key] = recent[-12:]
+        return limited
 
 
 def parse_cookie_file() -> str:
@@ -335,7 +487,8 @@ def validate_job(body: Any) -> tuple[list[str], list[str]]:
         parsed = urlparse(link)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"URL tidak valid: {link}")
-        if "shopee.co.id" not in parsed.netloc.lower():
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.username or parsed.password or (hostname != "shopee.co.id" and not hostname.endswith(".shopee.co.id")):
             raise ValueError("Semua URL harus berasal dari Shopee Indonesia")
     for tag in tags:
         if tag and (len(tag) > 64 or not re.fullmatch(r"[A-Za-z0-9]+", tag)):
@@ -492,16 +645,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{time.strftime('%H:%M:%S')}] {fmt % args}")
 
-    def send_json(self, value: Any, status: int = HTTPStatus.OK) -> None:
+    def bridge_origin(self) -> str | None:
+        origin = self.headers.get("Origin", "")
+        if origin.startswith("chrome-extension://"):
+            return origin
+        if origin in {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}:
+            return origin
+        return None
+
+    def send_json(self, value: Any, status: int = HTTPStatus.OK, *, set_cookie: str | None = None) -> None:
         raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
-        if self.path.startswith("/api/bridge/"):
-            self.send_header("Access-Control-Allow-Origin", "*")
+        if self.path.startswith("/api/bridge/") or self.headers.get("Origin", "").startswith("chrome-extension://"):
+            origin = self.bridge_origin()
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -511,8 +678,33 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Request terlalu besar")
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def require_user(self) -> sqlite3.Row | None:
+        user = current_user(self)
+        if not user:
+            self.send_json({"error": "Login diperlukan"}, HTTPStatus.UNAUTHORIZED)
+        return user
+
+    def send_redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/login":
+            if current_user(self, touch=False):
+                self.send_redirect("/")
+            else:
+                self.send_html(LOGIN_HTML)
+            return
+        if parsed.path == "/api/auth/me":
+            user = current_user(self)
+            if not user:
+                self.send_json({"error": "Login diperlukan"}, HTTPStatus.UNAUTHORIZED)
+            else:
+                self.send_json({"user": {"email": user["email"], "role": user["role"], "must_change_password": bool(user["must_change_password"])}})
+            return
         if parsed.path == "/api/health":
             with BRIDGE_CONDITION:
                 last_seen = float(BRIDGE_LAST_SEEN.get("timestamp", 0))
@@ -523,17 +715,23 @@ class Handler(BaseHTTPRequestHandler):
                     "last_seen": last_seen or None,
                     "busy": BRIDGE_CURRENT is not None,
                 }
-            self.send_json({"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge, "database": str(DB_PATH)})
+            self.send_json({"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge})
             return
         if parsed.path == "/api/bridge/next":
+            if not self.require_user():
+                return
             self.send_json(bridge_next())
             return
         if parsed.path == "/api/jobs":
+            if not self.require_user():
+                return
             with db() as conn:
                 rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 50").fetchall()
             self.send_json({"jobs": [job_dict(row) for row in rows]})
             return
         if parsed.path.startswith("/api/jobs/"):
+            if not self.require_user():
+                return
             job_id = parsed.path.rsplit("/", 1)[-1]
             with db() as conn:
                 row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -543,14 +741,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(job_dict(row))
             return
         if parsed.path in {"/", "/index.html"}:
-            self.send_html(INDEX_HTML)
+            if not current_user(self, touch=False):
+                self.send_redirect("/login")
+            else:
+                self.send_html(INDEX_HTML)
             return
         self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
 
     def do_OPTIONS(self) -> None:
-        if self.path.startswith("/api/bridge/"):
+        if self.path.startswith("/api/bridge/") or self.headers.get("Origin", "").startswith("chrome-extension://"):
             self.send_response(HTTPStatus.NO_CONTENT)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            origin = self.bridge_origin()
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
+                self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.end_headers()
@@ -560,13 +765,60 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/login":
+            try:
+                body = self.read_json()
+                email = normalize_email(body.get("email") if isinstance(body, dict) else "")
+                password = str(body.get("password", "")) if isinstance(body, dict) else ""
+                key = f"{self.client_address[0]}:{email[:120]}"
+                if login_rate_limited(key):
+                    self.send_json({"error": "Terlalu banyak percobaan. Coba lagi dalam satu menit."}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                with db() as conn:
+                    user = conn.execute("SELECT * FROM users WHERE email=? AND role='superadmin'", (email,)).fetchone()
+                if not user or not verify_password(password, user["password_hash"]):
+                    self.send_json({"error": "Email atau password salah"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                token = create_session(int(user["id"]))
+                cookie = f"{AUTH_COOKIE_NAME}={token}; HttpOnly; Path=/; Max-Age={AUTH_SESSION_TTL}; SameSite=Lax"
+                self.send_json({"user": {"email": user["email"], "role": user["role"]}, "must_change_password": bool(user["must_change_password"])}, set_cookie=cookie)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/auth/logout":
+            revoke_session(self)
+            expired = f"{AUTH_COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"
+            self.send_json({"ok": True}, set_cookie=expired)
+            return
+        if parsed.path == "/api/auth/change-password":
+            user = self.require_user()
+            if not user:
+                return
+            try:
+                body = self.read_json()
+                current_password = str(body.get("current_password", "")) if isinstance(body, dict) else ""
+                new_password = validate_password(body.get("new_password") if isinstance(body, dict) else "")
+                with db() as conn:
+                    stored = conn.execute("SELECT password_hash FROM users WHERE id=?", (user["id"],)).fetchone()
+                    if not stored or not verify_password(current_password, stored["password_hash"]):
+                        self.send_json({"error": "Password saat ini salah"}, HTTPStatus.UNAUTHORIZED)
+                        return
+                    conn.execute("UPDATE users SET password_hash=?, must_change_password=0, updated_at=? WHERE id=?", (password_hash(new_password), now(), user["id"]))
+                self.send_json({"ok": True, "must_change_password": False})
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/bridge/ping":
+            if not self.require_user():
+                return
             try:
                 self.send_json(bridge_ping(self.read_json()))
             except (ValueError, json.JSONDecodeError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/bridge/result":
+            if not self.require_user():
+                return
             try:
                 self.send_json(bridge_result(self.read_json()))
             except (ValueError, json.JSONDecodeError) as exc:
@@ -574,6 +826,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path != "/api/jobs":
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        user = self.require_user()
+        if not user:
+            return
+        if user["must_change_password"]:
+            self.send_json({"error": "Ganti password terlebih dahulu"}, HTTPStatus.FORBIDDEN)
             return
         try:
             links, tags = validate_job(self.read_json())
@@ -593,9 +851,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
 
+
+LOGIN_HTML = r'''<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Masuk · Fahra Affiliate Rotator</title>
+  <script>document.documentElement.dataset.theme=localStorage.getItem('fahra-theme')||((matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark');</script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&display=swap');
+    :root{color-scheme:dark;--stage:#0e0d0c;--light:#f5efe4;--muted:#b5aaa0;--paper:#fffdf8;--ink:#1a1714;--accent:#e98425;--focus:#a7d8c7;--error:#9a2d2d;--serif:'Instrument Serif',Georgia,serif;--sans:Inter,system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
+    [data-theme="light"]{color-scheme:light;--stage:#eee8de;--light:#241f1a;--muted:#685f57;--accent:#b75b10}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse 90% 60% at 50% -10%,rgba(233,132,37,.2),transparent 70%),var(--stage);color:var(--light);font:14px/1.5 var(--sans)}.shell{width:min(430px,100%)}.brand{font:11px/1 var(--mono);letter-spacing:.16em;opacity:.7;margin-bottom:34px}.card{background:var(--paper);color:var(--ink);border-radius:18px;padding:28px;box-shadow:0 18px 40px rgba(0,0,0,.2)}h1{font:italic 700 clamp(2.4rem,12vw,4rem)/.98 var(--serif);margin:0 0 12px}.dek{color:var(--muted);margin:0 0 26px}label{display:block;font-weight:650;margin:16px 0 6px}input,button,select{width:100%;min-height:44px;font:inherit}input,select{border:1px solid #cfc7bd;border-radius:8px;background:var(--paper);color:var(--ink);padding:11px 12px}button{border:0;border-radius:999px;background:var(--ink);color:var(--paper);padding:12px 18px;margin-top:20px;font-weight:700;cursor:pointer}button:hover{opacity:.86}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid var(--focus);outline-offset:2px}.message{min-height:22px;color:var(--error);margin:12px 0 0}.theme{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:18px;color:var(--muted);font-size:.9rem}.theme select{width:auto;min-height:38px;padding:6px 9px}@media(max-width:480px){body{padding:16px}.card{padding:22px;border-radius:14px}.brand{margin-bottom:24px}}
+  </style>
+</head>
+<body><main class="shell"><div class="brand">FAHRA AFFILIATE ROTATOR</div><section class="card" aria-labelledby="login-title"><h1 id="login-title">Masuk dulu.</h1><p class="dek">Kelola antrean link khusus Shopee dari satu tempat.</p><form id="login-form"><label for="email">Email superadmin</label><input id="email" name="email" type="email" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button id="login-button" type="submit">Masuk ke dashboard</button><p id="message" class="message" role="alert" aria-live="polite"></p></form><div class="theme"><span>Tema tampilan</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select></div></section></main>
+<script>
+const themeSelect=document.querySelector('#theme-select');function applyTheme(value){localStorage.setItem('fahra-theme',value);document.documentElement.dataset.theme=value==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):value;themeSelect.value=value}applyTheme(localStorage.getItem('fahra-theme')||'system');themeSelect.addEventListener('change',()=>applyTheme(themeSelect.value));
+document.querySelector('#login-form').addEventListener('submit',async(event)=>{event.preventDefault();const button=document.querySelector('#login-button'),message=document.querySelector('#message');button.disabled=true;message.textContent='';try{const response=await fetch('/api/auth/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.querySelector('#email').value,password:document.querySelector('#password').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Login gagal');location.href='/'}catch(error){message.textContent=error.message}finally{button.disabled=false}});
+</script></body></html>'''
 
 INDEX_HTML = r'''<!doctype html>
 <html lang="id">
@@ -605,7 +883,8 @@ INDEX_HTML = r'''<!doctype html>
   <title>Link khusus Shopee</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&display=swap');
-    :root { color-scheme: dark; --stage:#0e0d0c; --stage-2:#1a1714; --ink:#1a1714; --light:#f5efe4; --muted:#746d66; --paper:#fffdf8; --line:#ebe6dd; --accent:#e98425; --accent-2:#ff6b3d; --warn:#8a4b16; --error:#9a2d2d; --serif:'Instrument Serif',Georgia,serif; --sans:Inter,system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace; }
+    :root { color-scheme: dark; --stage:#0e0d0c; --stage-2:#1a1714; --ink:#1a1714; --light:#f5efe4; --muted:#b5aaa0; --paper:#fffdf8; --line:#ebe6dd; --accent:#e98425; --accent-2:#ff6b3d; --warn:#8a4b16; --error:#9a2d2d; --focus:#a7d8c7; --serif:'Instrument Serif',Georgia,serif; --sans:Inter,system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace; }
+    [data-theme="light"] { color-scheme: light; --stage:#eee8de; --stage-2:#f8f4ec; --light:#241f1a; --muted:#685f57; --line:#ded6ca; --accent:#b75b10; --warn:#8a4b16; }
     * { box-sizing:border-box; }
     body { margin:0; min-height:100vh; background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(233,132,37,.18),transparent 70%),var(--stage); color:var(--light); font:14px/1.5 var(--sans); }
     main { width:min(1180px, calc(100% - 44px)); margin:0 auto 64px; }
@@ -621,7 +900,7 @@ INDEX_HTML = r'''<!doctype html>
     label { display:block; font-weight:650; margin:15px 0 6px; }
     textarea,input { width:100%; min-height:44px; border:1px solid #cfc7bd; border-radius:8px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; }
     textarea { min-height:160px; resize:vertical; }
-    input:focus,textarea:focus,button:focus-visible { outline:3px solid #a7d8c7; outline-offset:2px; }
+    input:focus,textarea:focus,button:focus-visible,select:focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
     .tags { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
     .tags input { min-width:0; }
     button { min-height:44px; margin-top:18px; border:0; border-radius:999px; background:var(--ink); color:var(--light); padding:13px 18px; font-weight:700; cursor:pointer; }
@@ -652,10 +931,18 @@ INDEX_HTML = r'''<!doctype html>
     .pagination button[aria-current="page"] { background:var(--ink); color:var(--light); }
     .pagination button:disabled { opacity:.4; cursor:not-allowed; }
     .pagination .pagination-control { white-space:nowrap; }
+    .header-tools { display:flex; flex:0 1 330px; align-items:stretch; gap:10px; }
+    .account { display:grid; gap:6px; justify-items:end; font-size:12px; color:var(--muted); }
+    .account button { margin:0; width:auto; min-height:38px; padding:8px 13px; }
+    .account select { min-height:38px; max-width:120px; border:1px solid rgba(245,239,228,.25); border-radius:8px; background:var(--stage-2); color:var(--light); padding:6px 8px; }
+    .password-panel { margin:0 0 22px; border:1px solid var(--line); border-radius:14px; padding:18px 20px; background:var(--paper); color:var(--ink); }
+    .password-panel[hidden] { display:none; }
+    .password-panel button { width:100%; }
     @media (max-width: 860px) {
       main { width:min(100% - 32px, 680px); margin-top:24px; margin-bottom:48px; }
       header { display:block; margin-bottom:26px; }
       .signal { width:100%; margin-top:18px; }
+      .header-tools { width:100%; margin-top:18px; }
       .layout { grid-template-columns:1fr; gap:16px; }
     }
     @media (max-width: 560px) {
@@ -672,6 +959,10 @@ INDEX_HTML = r'''<!doctype html>
       .pagination button { width:auto; margin-top:0; }
       .pagination .pagination-control { flex:1 1 calc(50% - 5px); }
       .pagination-list { order:3; flex-basis:100%; }
+      .header-tools { display:grid; grid-template-columns:1fr; }
+      .account { justify-items:stretch; grid-template-columns:1fr 1fr; align-items:center; }
+      .account button { width:100%; }
+      .account select { max-width:none; width:100%; }
     }
     @media (max-width: 380px) {
       main { width:calc(100% - 20px); }
@@ -686,8 +977,9 @@ INDEX_HTML = r'''<!doctype html>
 <main>
   <header>
     <div><h1>Buat link yang <span style="color:var(--accent)">bekerja.</span></h1><p class="dek">Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.</p></div>
-    <div class="signal" id="health" role="status">Memeriksa worker...</div>
+    <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="logout" type="button">Keluar</button></div></div>
   </header>
+  <section id="password-panel" class="password-panel" hidden aria-labelledby="password-title"><h2 id="password-title">Ganti password awal</h2><p class="hint">Untuk keamanan, ganti password bootstrap sebelum membuat job.</p><form id="password-form"><label for="current-password">Password saat ini</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Password baru</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required><button type="submit">Simpan password baru</button><p id="password-message" class="hint" role="status"></p></form></section>
   <div class="layout">
     <section aria-labelledby="create-title">
       <h2 id="create-title">Buat batch link</h2>
@@ -720,6 +1012,26 @@ const $ = (s) => document.querySelector(s);
 const JOBS_PER_PAGE = 5;
 let jobsCache = [];
 let currentPage = 1;
+let currentUser = null;
+function applyTheme(value) {
+  localStorage.setItem('fahra-theme', value);
+  document.documentElement.dataset.theme = value === 'system' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : value;
+  $('#theme-select').value = value;
+}
+async function api(url, options = {}) {
+  const response = await fetch(url, { credentials: 'include', cache: 'no-store', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
+  let data = {};
+  try { data = await response.json(); } catch (_) {}
+  if (response.status === 401) { location.href = '/login'; throw new Error('Login diperlukan'); }
+  if (!response.ok) throw new Error(data.error || `Request gagal (${response.status})`);
+  return data;
+}
+function updatePasswordLock() {
+  const locked = Boolean(currentUser?.must_change_password);
+  $('#password-panel').hidden = !locked;
+  $('#job-form').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = locked; });
+  if (locked) $('#form-message').textContent = 'Ganti password awal di atas untuk membuka pembuatan job.';
+}
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function sourceLabel(value) {
   try {
@@ -782,11 +1094,31 @@ function showCopyFeedback(link, message, copied) {
   }, 2200);
 }
 async function refresh() {
-  const [health, jobs] = await Promise.all([fetch('/api/health').then(r => r.json()), fetch('/api/jobs').then(r => r.json())]);
+  const me = await api('/api/auth/me');
+  const [health, jobs] = await Promise.all([api('/api/health'), api('/api/jobs')]);
+  currentUser = me.user;
+  $('#account-email').textContent = currentUser.email;
+  applyTheme(localStorage.getItem('fahra-theme') || 'system');
   $('#health').textContent = health.worker ? (health.bridge?.connected ? 'Bridge aktif' : 'Menunggu extension') : 'Worker berhenti';
   jobsCache = Array.isArray(jobs.jobs) ? jobs.jobs : [];
+  updatePasswordLock();
   renderJobs();
 }
+$('#theme-select').addEventListener('change', () => applyTheme($('#theme-select').value));
+applyTheme(localStorage.getItem('fahra-theme') || 'system');
+$('#logout').addEventListener('click', async () => { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); location.href = '/login'; });
+$('#password-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button');
+  const message = $('#password-message');
+  button.disabled = true; message.textContent = '';
+  try {
+    await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password: $('#current-password').value, new_password: $('#new-password').value }) });
+    $('#current-password').value = ''; $('#new-password').value = '';
+    message.textContent = 'Password tersimpan. Pembuatan job sudah dibuka.';
+    await refresh();
+  } catch (error) { message.textContent = error.message; } finally { button.disabled = false; }
+});
 $('#jobs-pagination').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-page]');
   if (!button || button.disabled) return;
@@ -803,9 +1135,9 @@ $('#jobs').addEventListener('click', async (event) => {
 $('#job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const button = $('#submit'); button.disabled = true; $('#form-message').textContent = 'Menyimpan job...';
   const tags = [1,2,3,4,5].map(i => event.target.elements[`tag${i}`].value.trim());
-  try { const response = await fetch('/api/jobs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({links:$('#links').value, tags})}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Job gagal dibuat'); $('#links').value=''; [1,2,3,4,5].forEach(i => event.target.elements[`tag${i}`].value=''); $('#form-message').textContent = `Job ${data.id} masuk antrean.`; await refresh(); } catch (error) { $('#form-message').textContent = error.message; } finally { button.disabled = false; }
+  try { const data = await api('/api/jobs', {method:'POST', body:JSON.stringify({links:$('#links').value, tags})}); $('#links').value=''; [1,2,3,4,5].forEach(i => event.target.elements[`tag${i}`].value=''); $('#form-message').textContent = `Job ${data.id} masuk antrean.`; await refresh(); } catch (error) { $('#form-message').textContent = error.message; } finally { button.disabled = false; }
 });
-refresh().catch(() => { $('#health').textContent = 'Backend tidak merespons'; });
+refresh().catch((error) => { $('#health').textContent = error.message || 'Backend tidak merespons'; });
 setInterval(() => refresh().catch(() => {}), 2500);
 </script>
 </body>
@@ -814,6 +1146,9 @@ setInterval(() => refresh().catch(() => {}), 2500);
 
 def main() -> None:
     init_db()
+    if "--bootstrap-admin" in os.sys.argv:
+        bootstrap_admin()
+        return
     WORKER.start()
     server = ThreadingHTTPServer((os.getenv("HOST", "127.0.0.1"), PORT), Handler)
     print(f"Fahra Affiliate Rotator berjalan di http://{server.server_address[0]}:{PORT}")

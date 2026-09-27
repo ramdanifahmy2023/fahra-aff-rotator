@@ -92,7 +92,8 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
 - Mengisi URL/tag lewat DOM halaman, bukan request mentah.
 - Membaca hasil dari modal, termasuk field `input` atau `textarea` yang disabled.
 - Memiliki recovery ketika channel pesan Chrome terputus atau halaman merender ulang.
-- Tidak mengirim cookie atau token sesi ke webapp.
+- Tidak mengirim cookie Shopee ke webapp; request bridge hanya membawa session
+  aplikasi HttpOnly agar endpoint lokal terlindungi.
 
 ### Webapp dan API
 
@@ -103,7 +104,12 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
 - `POST /api/jobs` membuat job.
 - `GET /api/jobs` menampilkan daftar job.
 - `GET /api/jobs/<id>` menampilkan detail job.
-- `GET /api/health` menampilkan worker, bridge, dan database aktif.
+- `GET /api/health` menampilkan status worker dan bridge tanpa membocorkan path
+  filesystem internal.
+- Halaman login membatasi akses ke satu superadmin. Session cookie HttpOnly dipakai
+  untuk webapp dan extension bridge, dengan rate limit login dan password bootstrap
+  yang wajib diganti.
+- Dashboard menyediakan pemilih tema sistem/terang/gelap dan layout mobile friendly.
 
 ## Keamanan dan privasi
 
@@ -126,8 +132,10 @@ Fitur dianggap selesai bila:
    pada API serta UI.
 4. Modal hasil yang dirender sebagai field disabled tetap dapat dibaca.
 5. Saat sesi tidak siap, job mendapat `needs_session` dengan tindakan yang jelas.
-6. Tidak ada credential atau database runtime pada commit Git.
-7. Validasi Python/JavaScript dan `git diff --check` lulus.
+6. Halaman job tidak dapat dibaca atau ditulis tanpa session superadmin.
+7. Tema terang, gelap, dan sistem dapat dipilih pada login serta dashboard.
+8. Tidak ada credential atau database runtime pada commit Git.
+9. Validasi Python/JavaScript dan `git diff --check` lulus.
 
 ## Kondisi saat ini
 
@@ -138,6 +146,8 @@ Yang sudah berjalan:
 - Extension Manifest V3 untuk bridge tab browser.
 - Fallback browser worker dan HTTP diagnosis tetap tersedia.
 - Repository private dengan README dan changelog.
+- Auth superadmin, session SQLite, bootstrap password satu kali, dan proteksi bridge.
+- Halaman login, ganti password awal, tema sistem/terang/gelap, serta responsive UI.
 
 Yang masih perlu diperbaiki:
 
@@ -145,7 +155,8 @@ Yang masih perlu diperbaiki:
   beberapa bentuk modal dan navigasi.
 - Pesan `needs_session` perlu membedakan login, CAPTCHA/verifikasi, tab salah, dan
   timeout hasil agar troubleshooting lebih cepat.
-- Belum ada autentikasi webapp untuk akses lintas-device.
+- Akses lintas-device masih memerlukan deployment terpisah dengan TLS dan kontrol
+  jaringan; runtime saat ini tetap bind ke loopback.
 - Belum ada observability terstruktur untuk latency job tanpa mencatat data sensitif.
 
 ## Roadmap

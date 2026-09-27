@@ -77,10 +77,31 @@ mesin lain tanpa menyesuaikannya.
 
 ## API lokal
 
+Semua endpoint job dan bridge memerlukan session superadmin. `/api/health` tetap
+memberi ringkasan aman tanpa path database. Login memakai:
+
+```sh
+curl -sS -c /tmp/fahra-session -H 'Content-Type: application/json' \
+  -d '{"email":"...","password":"..."}' \
+  http://127.0.0.1:8788/api/auth/login
+```
+
+Jangan menyimpan credential nyata di shell history atau dokumentasi. Untuk membuat
+user awal, gunakan bootstrap sekali lalu ganti password dari UI:
+
+```sh
+SUPERADMIN_EMAIL="..." SUPERADMIN_INITIAL_PASSWORD="..." \
+  AFFILIATE_DB="/path/ke/affiliate.sqlite3" python3 app.py --bootstrap-admin
+```
+
+Endpoint auth tambahan: `GET /api/auth/me`, `POST /api/auth/logout`, dan
+`POST /api/auth/change-password` dengan body `current_password` dan
+`new_password`. Password baru minimal 12 karakter.
+
 Membuat job:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8788/api/jobs \
+curl -sS -b /tmp/fahra-session -X POST http://127.0.0.1:8788/api/jobs \
   -H 'Content-Type: application/json' \
   --data '{"links":["https://shopee.co.id/..."],"tags":["konten"]}'
 ```
@@ -94,8 +115,8 @@ Response sukses hanya berarti job masuk queue:
 Periksa hasil sebenarnya:
 
 ```sh
-curl -sS http://127.0.0.1:8788/api/jobs
-curl -sS http://127.0.0.1:8788/api/jobs/<job-id>
+curl -sS -b /tmp/fahra-session http://127.0.0.1:8788/api/jobs
+curl -sS -b /tmp/fahra-session http://127.0.0.1:8788/api/jobs/<job-id>
 ```
 
 Job selesai harus memiliki `status: "completed"` dan `result[].shortLink`.

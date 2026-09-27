@@ -9,6 +9,7 @@ function wait(ms) {
 async function request(path, options = {}) {
   const response = await fetch(APP_URL + path, {
     cache: 'no-store',
+    credentials: 'include',
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
   });
