@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Memperbaiki layout responsif webapp dengan breakpoint berbasis lebar konten,
+  susunan satu kolom di layar sempit, ukuran kontrol minimum 44px, dan pembungkusan
+  URL atau ID job panjang agar tidak membuat scroll horizontal.
 - Menambahkan commit dan rollback eksplisit pada wrapper SQLite agar job yang masuk
   antrean tidak hilang saat koneksi ditutup.
 - Memindahkan database runtime LaunchAgent ke lokasi lokal yang stabil dan memulihkan
