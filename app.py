@@ -629,16 +629,18 @@ INDEX_HTML = r'''<!doctype html>
     button:disabled { opacity:.55; cursor:wait; }
     .hint { color:var(--muted); font-size:.88rem; margin:7px 0 0; }
     .jobs { display:grid; gap:11px; }
-    .job { border-top:1px solid var(--line); padding-top:12px; }
+    .job { min-width:0; border-top:1px solid var(--line); padding-top:12px; }
     .job:first-child { border-top:0; padding-top:0; }
     .job-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:start; }
     .job-head > div { min-width:0; }
-    .job-head strong { display:block; overflow-wrap:anywhere; }
+    .job-source { display:-webkit-box; min-width:0; overflow:hidden; color:var(--ink); font-weight:700; line-height:1.35; overflow-wrap:anywhere; text-decoration:none; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+    .job-source:hover { color:var(--accent); text-decoration:underline; }
     .job-id { font-family:var(--mono); font-size:.78rem; color:var(--muted); }
     .status { font:500 .72rem/1 var(--mono); text-transform:uppercase; letter-spacing:.04em; }
     .completed { color:#207044; } .failed,.needs_session { color:var(--error); } .queued,.running { color:var(--warn); }
-    .result { margin-top:9px; display:grid; gap:6px; }
-    .result a { color:var(--accent); overflow-wrap:anywhere; }
+    .result { min-width:0; margin-top:9px; display:grid; gap:6px; }
+    .result > div { min-width:0; }
+    .result a { display:inline-block; max-width:100%; color:var(--accent); overflow-wrap:anywhere; }
     .error { color:var(--error); font-size:.9rem; }
     .empty { color:var(--muted); padding:22px 0; }
     @media (max-width: 860px) {
@@ -702,9 +704,18 @@ INDEX_HTML = r'''<!doctype html>
 <script>
 const $ = (s) => document.querySelector(s);
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function sourceLabel(value) {
+  try {
+    const url = new URL(value);
+    return url.pathname.replace(/^\/+/, '') || url.hostname;
+  } catch (_) {
+    return value;
+  }
+}
 function renderJob(job) {
   const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div><span>${i + 1}. </span><a href="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer">${escapeHtml(row.shortLink)}</a></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
-  return `<article class="job"><div class="job-head"><div><strong>${escapeHtml(job.links[0])}</strong><div class="job-id">${escapeHtml(job.id)}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
+  const source = String(job.links?.[0] || '');
+  return `<article class="job"><div class="job-head"><div><a class="job-source" href="${escapeHtml(source)}" target="_blank" rel="noreferrer" title="${escapeHtml(source)}" aria-label="Buka URL sumber: ${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</a><div class="job-id">${escapeHtml(job.id)}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
 }
 async function refresh() {
   const [health, jobs] = await Promise.all([fetch('/api/health').then(r => r.json()), fetch('/api/jobs').then(r => r.json())]);

@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Memadatkan URL sumber pada kartu `Job terakhir` menjadi label path maksimal dua
+  baris, sambil mempertahankan URL lengkap sebagai link yang dapat dibuka agar daftar
+  job tidak melebar atau membengkak di viewport sempit.
 - Memperbaiki layout responsif webapp dengan breakpoint berbasis lebar konten,
   susunan satu kolom di layar sempit, ukuran kontrol minimum 44px, dan pembungkusan
   URL atau ID job panjang agar tidak membuat scroll horizontal.
