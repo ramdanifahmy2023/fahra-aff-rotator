@@ -1,0 +1,15 @@
+{
+  "name": "fahra-aff-rotator",
+  "version": "1.0.0",
+  "description": "Webapp lokal dan worker durable untuk membuat custom link Shopee Affiliate dari satu sampai lima URL per job.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "puppeteer-core": "^24.20.0"
+  }
+}
