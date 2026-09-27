@@ -865,7 +865,7 @@ LOGIN_HTML = r'''<!doctype html>
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Masuk · Fahra Affiliate Rotator</title>
-  <script>document.documentElement.dataset.theme=localStorage.getItem('fahra-theme')||((matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark');</script>
+  <script>const storedTheme=localStorage.getItem('fahra-theme');const savedTheme=['system','light','dark'].includes(storedTheme)?storedTheme:'system';document.documentElement.dataset.theme=savedTheme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):savedTheme;</script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&display=swap');
     :root{color-scheme:dark;--stage:#0e0d0c;--light:#f5efe4;--muted:#b5aaa0;--paper:#fffdf8;--ink:#1a1714;--accent:#e98425;--focus:#a7d8c7;--error:#9a2d2d;--serif:'Instrument Serif',Georgia,serif;--sans:Inter,system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace}
@@ -875,7 +875,7 @@ LOGIN_HTML = r'''<!doctype html>
 </head>
 <body><main class="shell"><div class="brand">FAHRA AFFILIATE ROTATOR</div><section class="card" aria-labelledby="login-title"><h1 id="login-title">Masuk dulu.</h1><p class="dek">Kelola antrean link khusus Shopee dari satu tempat.</p><form id="login-form"><label for="email">Email superadmin</label><input id="email" name="email" type="email" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button id="login-button" type="submit">Masuk ke dashboard</button><p id="message" class="message" role="alert" aria-live="polite"></p></form><div class="theme"><span>Tema tampilan</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select></div></section></main>
 <script>
-const themeSelect=document.querySelector('#theme-select');function applyTheme(value){localStorage.setItem('fahra-theme',value);document.documentElement.dataset.theme=value==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):value;themeSelect.value=value}applyTheme(localStorage.getItem('fahra-theme')||'system');themeSelect.addEventListener('change',()=>applyTheme(themeSelect.value));
+const themeSelect=document.querySelector('#theme-select'),themeMedia=matchMedia('(prefers-color-scheme: light)');function normalizeTheme(value){return ['system','light','dark'].includes(value)?value:'system'}function resolveTheme(value){return normalizeTheme(value)==='system'?(themeMedia.matches?'light':'dark'):normalizeTheme(value)}function applyTheme(value){value=normalizeTheme(value);localStorage.setItem('fahra-theme',value);document.documentElement.dataset.theme=resolveTheme(value);themeSelect.value=value}applyTheme(localStorage.getItem('fahra-theme')||'system');themeSelect.addEventListener('change',()=>applyTheme(themeSelect.value));const updateSystemTheme=()=>{if(normalizeTheme(localStorage.getItem('fahra-theme'))==='system')document.documentElement.dataset.theme=resolveTheme('system')};if(themeMedia.addEventListener)themeMedia.addEventListener('change',updateSystemTheme);else themeMedia.addListener(updateSystemTheme);
 document.querySelector('#login-form').addEventListener('submit',async(event)=>{event.preventDefault();const button=document.querySelector('#login-button'),message=document.querySelector('#message');button.disabled=true;message.textContent='';try{const response=await fetch('/api/auth/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.querySelector('#email').value,password:document.querySelector('#password').value})});const data=await response.json();if(!response.ok)throw new Error(data.error||'Login gagal');location.href='/'}catch(error){message.textContent=error.message}finally{button.disabled=false}});
 </script></body></html>'''
 
@@ -885,19 +885,20 @@ INDEX_HTML = r'''<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Link khusus Shopee</title>
+  <script>const storedTheme=localStorage.getItem('fahra-theme');const savedTheme=['system','light','dark'].includes(storedTheme)?storedTheme:'system';document.documentElement.dataset.theme=savedTheme==='system'?(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'):savedTheme;</script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&display=swap');
-    :root { color-scheme: dark; --stage:#0e0d0c; --stage-2:#1a1714; --ink:#1a1714; --light:#f5efe4; --muted:#b5aaa0; --paper:#fffdf8; --line:#ebe6dd; --accent:#e98425; --accent-2:#ff6b3d; --warn:#8a4b16; --error:#9a2d2d; --focus:#a7d8c7; --serif:'Instrument Serif',Georgia,serif; --sans:Inter,system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace; }
-    [data-theme="light"] { color-scheme: light; --stage:#eee8de; --stage-2:#f8f4ec; --light:#241f1a; --muted:#685f57; --line:#ded6ca; --accent:#b75b10; --warn:#8a4b16; }
+    :root { color-scheme: dark; --stage:#0e0d0c; --stage-2:#1a1714; --stage-line:rgba(245,239,228,.2); --ink:#1a1714; --light:#f5efe4; --muted:#b5aaa0; --paper:#fffdf8; --line:#ebe6dd; --accent:#e98425; --accent-2:#ff6b3d; --warn:#8a4b16; --error:#9a2d2d; --focus:#a7d8c7; --hover:#302923; --serif:'Instrument Serif',Georgia,serif; --sans:Inter,system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace; }
+    [data-theme="light"] { color-scheme: light; --stage:#eee8de; --stage-2:#f8f4ec; --stage-line:rgba(36,31,26,.18); --light:#241f1a; --muted:#685f57; --line:#ded6ca; --accent:#b75b10; --warn:#8a4b16; --hover:#3b3028; }
     * { box-sizing:border-box; }
     body { margin:0; min-height:100vh; background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(233,132,37,.18),transparent 70%),var(--stage); color:var(--light); font:14px/1.5 var(--sans); }
     main { width:min(1180px, calc(100% - 44px)); margin:0 auto 64px; }
     header { position:relative; display:flex; justify-content:space-between; gap:24px; align-items:end; margin:0 -4px 34px; padding:24px 0 0; }
-    header::before { content:'FAHRA AFFILIATE ROTATOR'; position:absolute; top:24px; left:0; font:11px/1 var(--mono); letter-spacing:.16em; color:rgba(245,239,228,.54); }
+    header::before { content:'FAHRA AFFILIATE ROTATOR'; position:absolute; top:24px; left:0; font:11px/1 var(--mono); letter-spacing:.16em; color:var(--muted); }
     h1 { font:italic 700 clamp(2.4rem,5vw,4.8rem)/.98 var(--serif); letter-spacing:-.02em; margin:48px 0 12px; max-width:11ch; }
     h1::first-line { color:var(--light); }
-    .dek { max-width:580px; color:rgba(245,239,228,.66); margin:0; font-size:15px; }
-    .signal { min-width:0; flex:0 1 220px; padding:12px 14px; border:1px solid rgba(245,239,228,.18); background:var(--stage-2); color:var(--light); border-radius:10px; font:12px/1.4 var(--mono); }
+    .dek { max-width:580px; color:var(--muted); margin:0; font-size:15px; }
+    .signal { min-width:0; flex:1 1 160px; padding:12px 14px; border:1px solid var(--stage-line); background:var(--stage-2); color:var(--light); border-radius:10px; font:12px/1.4 var(--mono); }
     .layout { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr); gap:22px; align-items:start; }
     section { min-width:0; background:var(--paper); border:0; border-radius:18px; padding:24px; color:var(--ink); box-shadow:0 18px 40px rgba(0,0,0,.18); }
     h2 { font:700 1.15rem/1.2 var(--sans); margin:0 0 15px; }
@@ -908,7 +909,7 @@ INDEX_HTML = r'''<!doctype html>
     .tags { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
     .tags input { min-width:0; }
     button { min-height:44px; margin-top:18px; border:0; border-radius:999px; background:var(--ink); color:var(--light); padding:13px 18px; font-weight:700; cursor:pointer; }
-    button:hover { background:#302923; }
+    button:hover { background:var(--hover); }
     button:disabled { opacity:.55; cursor:wait; }
     .hint { color:var(--muted); font-size:.88rem; margin:7px 0 0; }
     .jobs { display:grid; gap:11px; }
@@ -935,10 +936,14 @@ INDEX_HTML = r'''<!doctype html>
     .pagination button[aria-current="page"] { background:var(--ink); color:var(--light); }
     .pagination button:disabled { opacity:.4; cursor:not-allowed; }
     .pagination .pagination-control { white-space:nowrap; }
-    .header-tools { display:flex; flex:0 1 330px; align-items:stretch; gap:10px; }
-    .account { display:grid; gap:6px; justify-items:end; font-size:12px; color:var(--muted); }
-    .account button { margin:0; width:auto; min-height:38px; padding:8px 13px; }
-    .account select { min-height:38px; max-width:120px; border:1px solid rgba(245,239,228,.25); border-radius:8px; background:var(--stage-2); color:var(--light); padding:6px 8px; }
+    .header-tools { display:flex; flex:0 1 430px; align-items:center; gap:10px; }
+    .account { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; min-width:0; font-size:12px; color:var(--muted); }
+    .account-email { max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--light); font-weight:600; }
+    .account button { margin:0; width:auto; min-height:40px; padding:8px 12px; }
+    .account select { min-height:40px; max-width:112px; border:1px solid var(--stage-line); border-radius:8px; background:var(--stage-2); color:var(--light); padding:6px 8px; }
+    .icon-button { width:44px !important; min-height:44px; padding:0 !important; display:inline-grid; place-items:center; border:1px solid var(--stage-line); background:var(--stage-2); color:var(--light); border-radius:10px; }
+    .icon-button svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
     .password-panel { margin:0 0 22px; border:1px solid var(--line); border-radius:14px; padding:18px 20px; background:var(--paper); color:var(--ink); }
     .password-panel[hidden] { display:none; }
     .password-panel button { width:100%; }
@@ -946,7 +951,7 @@ INDEX_HTML = r'''<!doctype html>
       main { width:min(100% - 32px, 680px); margin-top:24px; margin-bottom:48px; }
       header { display:block; margin-bottom:26px; }
       .signal { width:100%; margin-top:18px; }
-      .header-tools { width:100%; margin-top:18px; }
+      .header-tools { width:100%; margin-top:18px; align-items:stretch; }
       .layout { grid-template-columns:1fr; gap:16px; }
     }
     @media (max-width: 560px) {
@@ -963,10 +968,11 @@ INDEX_HTML = r'''<!doctype html>
       .pagination button { width:auto; margin-top:0; }
       .pagination .pagination-control { flex:1 1 calc(50% - 5px); }
       .pagination-list { order:3; flex-basis:100%; }
-      .header-tools { display:grid; grid-template-columns:1fr; }
-      .account { justify-items:stretch; grid-template-columns:1fr 1fr; align-items:center; }
-      .account button { width:100%; }
-      .account select { max-width:none; width:100%; }
+      .header-tools { display:flex; flex-wrap:wrap; }
+      .signal { flex:1 1 100%; }
+      .account { width:100%; justify-content:space-between; }
+      .account-email { flex:1 1 100%; max-width:none; }
+      .account select { flex:1 1 100px; max-width:none; }
     }
     @media (max-width: 380px) {
       main { width:calc(100% - 20px); }
@@ -981,7 +987,7 @@ INDEX_HTML = r'''<!doctype html>
 <main>
   <header>
     <div><h1>Buat link yang <span style="color:var(--accent)">bekerja.</span></h1><p class="dek">Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.</p></div>
-  <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="password-toggle" type="button">Edit password</button><button id="logout" type="button">Keluar</button></div></div>
+  <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email" class="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="password-toggle" class="icon-button" type="button" aria-label="Edit password" title="Edit password" aria-expanded="false" aria-controls="password-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z"/><path d="m14 7 3 3"/></svg><span class="sr-only">Edit password</span></button><button id="logout" class="icon-button" type="button" aria-label="Keluar" title="Keluar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg><span class="sr-only">Keluar</span></button></div></div>
   </header>
   <section id="password-panel" class="password-panel" hidden aria-labelledby="password-title"><h2 id="password-title">Ganti password</h2><p id="password-hint" class="hint">Masukkan password saat ini dan password baru.</p><form id="password-form"><label for="current-password">Password saat ini</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Password baru</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required><label for="new-password-confirmation">Ulangi password baru</label><input id="new-password-confirmation" type="password" autocomplete="new-password" minlength="12" required><button type="submit">Simpan password</button><p id="password-message" class="hint" role="status"></p></form></section>
   <div class="layout">
@@ -989,18 +995,18 @@ INDEX_HTML = r'''<!doctype html>
       <h2 id="create-title">Buat batch link</h2>
       <form id="job-form">
         <label for="links">URL Shopee</label>
-        <textarea id="links" name="links" required placeholder="Satu URL per baris"></textarea>
+        <textarea id="links" name="links" required placeholder="Satu URL per baris" disabled></textarea>
         <p class="hint">URL harus berasal dari shopee.co.id. Maksimal lima baris per job.</p>
         <label>Tag pelacakan</label>
         <div class="tags">
-          <input name="tag1" aria-label="Tag ke 1" placeholder="Tag 1">
-          <input name="tag2" aria-label="Tag ke 2" placeholder="Tag 2">
-          <input name="tag3" aria-label="Tag ke 3" placeholder="Tag 3">
-          <input name="tag4" aria-label="Tag ke 4" placeholder="Tag 4">
-          <input name="tag5" aria-label="Tag ke 5" placeholder="Tag 5">
+          <input name="tag1" aria-label="Tag ke 1" placeholder="Tag 1" disabled>
+          <input name="tag2" aria-label="Tag ke 2" placeholder="Tag 2" disabled>
+          <input name="tag3" aria-label="Tag ke 3" placeholder="Tag 3" disabled>
+          <input name="tag4" aria-label="Tag ke 4" placeholder="Tag 4" disabled>
+          <input name="tag5" aria-label="Tag ke 5" placeholder="Tag 5" disabled>
         </div>
         <p class="hint">Gunakan huruf dan angka saja. Tag akan masuk ke parameter subId Shopee.</p>
-        <button id="submit" type="submit">Masukkan ke worker</button>
+        <button id="submit" type="submit" disabled>Masukkan ke worker</button>
         <p id="form-message" class="hint" role="status"></p>
       </form>
     </section>
@@ -1019,10 +1025,15 @@ let currentPage = 1;
 let currentUser = null;
 let passwordPanelOpen = false;
 function applyTheme(value) {
+  value = normalizeTheme(value);
   localStorage.setItem('fahra-theme', value);
   document.documentElement.dataset.theme = value === 'system' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : value;
   $('#theme-select').value = value;
 }
+function normalizeTheme(value) { return ['system', 'light', 'dark'].includes(value) ? value : 'system'; }
+const themeMedia = matchMedia('(prefers-color-scheme: light)');
+const updateSystemTheme = () => { if (normalizeTheme(localStorage.getItem('fahra-theme')) === 'system') document.documentElement.dataset.theme = themeMedia.matches ? 'light' : 'dark'; };
+if (themeMedia.addEventListener) themeMedia.addEventListener('change', updateSystemTheme); else themeMedia.addListener(updateSystemTheme);
 async function api(url, options = {}) {
   const response = await fetch(url, { credentials: 'include', cache: 'no-store', ...options, headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } });
   let data = {};
@@ -1034,7 +1045,12 @@ async function api(url, options = {}) {
 function updatePasswordLock() {
   const locked = Boolean(currentUser?.must_change_password);
   $('#password-panel').hidden = !locked && !passwordPanelOpen;
-  $('#password-toggle').textContent = passwordPanelOpen || locked ? 'Tutup password' : 'Edit password';
+  const passwordToggle = $('#password-toggle');
+  const passwordAction = locked ? 'Password wajib diubah' : (passwordPanelOpen ? 'Tutup password' : 'Edit password');
+  passwordToggle.disabled = locked;
+  passwordToggle.setAttribute('aria-label', passwordAction);
+  passwordToggle.setAttribute('title', passwordAction);
+  passwordToggle.setAttribute('aria-expanded', String(locked || passwordPanelOpen));
   $('#password-hint').textContent = locked ? 'Untuk keamanan, ganti password bootstrap sebelum membuat job.' : 'Masukkan password saat ini dan password baru.';
   $('#job-form').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = locked; });
   if (locked) $('#form-message').textContent = 'Ganti password awal di atas untuk membuka pembuatan job.';
@@ -1113,7 +1129,7 @@ async function refresh() {
 }
 $('#theme-select').addEventListener('change', () => applyTheme($('#theme-select').value));
 applyTheme(localStorage.getItem('fahra-theme') || 'system');
-$('#password-toggle').addEventListener('click', () => { passwordPanelOpen = !passwordPanelOpen; updatePasswordLock(); if (passwordPanelOpen || currentUser?.must_change_password) $('#current-password').focus(); });
+$('#password-toggle').addEventListener('click', () => { if (currentUser?.must_change_password) return; const wasOpen = passwordPanelOpen; passwordPanelOpen = !passwordPanelOpen; if (wasOpen && !passwordPanelOpen) { $('#current-password').value = ''; $('#new-password').value = ''; $('#new-password-confirmation').value = ''; $('#password-message').textContent = ''; } updatePasswordLock(); if (passwordPanelOpen) $('#current-password').focus(); });
 $('#logout').addEventListener('click', async () => { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); location.href = '/login'; });
 $('#password-form').addEventListener('submit', async (event) => {
   event.preventDefault();

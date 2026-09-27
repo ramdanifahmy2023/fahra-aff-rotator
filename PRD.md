@@ -112,6 +112,10 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
 - Dashboard menyediakan pemilih tema sistem/terang/gelap dan layout mobile friendly.
 - Superadmin dapat mengedit password kapan saja dengan verifikasi password saat ini,
   konfirmasi password baru, dan pencabutan session lain setelah berhasil.
+- Toolbar akun memakai kontrol icon yang tetap dapat dibaca pembaca layar dan menata
+  ulang kontrol secara responsif tanpa memerlukan sidebar untuk alur dua panel ini.
+- Tema Sistem mengikuti perubahan preferensi OS, sedangkan nilai preferensi yang tidak
+  dikenal dipulihkan ke Sistem.
 
 ## Keamanan dan privasi
 

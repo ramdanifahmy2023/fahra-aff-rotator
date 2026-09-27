@@ -51,3 +51,10 @@
 - Menambahkan tombol Edit password di dashboard dengan konfirmasi password baru;
   panel tetap tersedia setelah bootstrap selesai dan session lain dicabut saat
   password berhasil diubah.
+- Merapikan toolbar dashboard menjadi kontrol icon yang tetap accessible melalui
+  `aria-label` dan tooltip, memperbaiki kontras header pada tema terang, serta
+  memastikan toolbar dan kartu tetap rapih di viewport mobile.
+- Memperbaiki tema Sistem agar mengikuti perubahan mode OS, menormalisasi nilai tema
+  yang rusak di localStorage, dan menghindari flash gelap saat tema terang dipilih.
+- Mengunci form job sampai status autentikasi selesai dan membersihkan field password
+  ketika panel edit ditutup.
