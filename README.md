@@ -23,7 +23,7 @@ SUPERADMIN_EMAIL="..." SUPERADMIN_INITIAL_PASSWORD="..." \
   AFFILIATE_DB="/path/ke/affiliate.sqlite3" python3 app.py --bootstrap-admin
 ```
 
-Dashboard menyediakan logout, tema Sistem/Terang/Gelap, dan tombol Edit password.
+Dashboard memakai sidebar responsif untuk Dashboard, MCP, Pengaturan, Riwayat, dan Keluar. Dashboard menampilkan lima hasil generate terbaru untuk salin cepat, sedangkan Riwayat menyimpan arsip lengkap. Sidebar desktop dapat diperkecil menjadi ikon. Riwayat memiliki badge job aktif dan filter status/tanggal, sedangkan MCP memiliki tombol tes koneksi. Tema Sistem/Terang/Gelap serta perubahan password tersedia di Pengaturan.
 Pembuatan job terkunci sampai password bootstrap diganti.
 
 Pada macOS worker dijalankan mandiri oleh LaunchAgent `com.fahra.aff-rotator`, sehingga tidak perlu menjalankan `./start.sh` setiap kali. Jika perintah itu dijalankan saat service sudah aktif, script hanya menampilkan alamat service lalu selesai.
@@ -74,6 +74,12 @@ Tool yang tersedia: `shopee_generate_short_links`, `shopee_get_job`,
 generate mengembalikan `job_id`; hasil dianggap selesai hanya ketika status
 `completed` dan `result[].shortLink` tersedia. `needs_session` berarti tab
 Custom Link Shopee perlu login atau verifikasi manual.
+
+Token MCP dapat dikelola dari menu **MCP** setelah login dashboard:
+buat token per client, salin konfigurasi untuk OpenClaw/Codex/Claude/Hermes,
+cabut akses, atau hapus token. Plaintext token hanya tampil sekali saat dibuat;
+server menyimpan hash token dan metadata saja. Atur `MCP_PUBLIC_URL` agar URL yang
+ditampilkan panel sesuai alamat yang dapat dijangkau client, misalnya alamat Tailscale.
 
 ## Extension bridge
 

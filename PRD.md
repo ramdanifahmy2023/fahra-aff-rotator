@@ -98,9 +98,10 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
 ### Webapp dan API
 
 - UI mengikuti referensi `gamified-app.zip`: dark warm stage, permukaan kartu terang,
-  tipografi editorial, dan responsive layout.
+  tipografi editorial, dan responsive layout dengan sidebar minimalis.
 - UI menampilkan sinyal worker/bridge secara eksplisit.
 - UI menampilkan job terbaru, status, error, dan short link.
+- Dashboard menampilkan lima job terakhir dengan short link yang dapat langsung disalin; Riwayat menyimpan seluruh daftar job.
 - `POST /api/jobs` membuat job.
 - `GET /api/jobs` menampilkan daftar job.
 - `GET /api/jobs/<id>` menampilkan detail job.
@@ -110,12 +111,18 @@ verifikasi manual tetap dilakukan pada browser ketika Shopee memintanya.
   untuk webapp dan extension bridge, dengan rate limit login dan password bootstrap
   yang wajib diganti.
 - Dashboard menyediakan pemilih tema sistem/terang/gelap dan layout mobile friendly.
+- Sidebar responsif menyediakan Dashboard, MCP, Pengaturan, Riwayat, dan Keluar; pada layar kecil navigasi tetap ringkas dan dapat digeser.
+- Menu Riwayat menampilkan badge jumlah job aktif, dapat difilter berdasarkan status dan rentang tanggal, serta menyediakan reset filter.
+- Halaman MCP menyediakan tes koneksi listener melalui endpoint internal tanpa membocorkan token.
+- Sidebar desktop dapat diperkecil menjadi mode ikon dan preferensinya disimpan di browser.
 - Superadmin dapat mengedit password kapan saja dengan verifikasi password saat ini,
   konfirmasi password baru, dan pencabutan session lain setelah berhasil.
-- Toolbar akun memakai kontrol icon yang tetap dapat dibaca pembaca layar dan menata
-  ulang kontrol secara responsif tanpa memerlukan sidebar untuk alur dua panel ini.
+- Navigasi utama memakai sidebar minimalis yang tetap dapat dibaca pembaca layar,
+  memiliki state aktif, dan berubah menjadi navigasi horizontal ringkas pada layar kecil.
 - Tema Sistem mengikuti perubahan preferensi OS, sedangkan nilai preferensi yang tidak
   dikenal dipulihkan ke Sistem.
+- Superadmin dapat membuat token MCP per client, melihat metadata token tanpa plaintext,
+  menyalin konfigurasi client, mencabut akses, dan menghapus token dari halaman MCP.
 
 ## Keamanan dan privasi
 
@@ -159,6 +166,8 @@ Yang sudah berjalan:
 - Halaman login, ganti password awal, tema sistem/terang/gelap, serta responsive UI.
 - MCP Streamable HTTP pada port 8790 dengan token Bearer runtime, audit metadata,
   idempotency key, bounded wait, dan akses Tailscale terbatas.
+- Manajemen token MCP dari dashboard dengan one-time reveal dan contoh konfigurasi
+  untuk OpenClaw, Codex CLI, Claude Code, dan Hermes Agent.
 
 Yang masih perlu diperbaiki:
 

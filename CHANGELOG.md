@@ -4,6 +4,10 @@
 
 ### Added
 
+- Menambahkan panel manajemen akses MCP pada dashboard untuk membuat token per
+  client, menampilkan plaintext satu kali, menyalin konfigurasi OpenClaw/Codex/
+  Claude/Hermes, serta mencabut atau menghapus token tanpa menyimpan secret di
+  frontend atau SQLite.
 - Menambahkan MCP Streamable HTTP terpisah pada port 8790 untuk OpenClaw dan agent
   lain, dengan token Bearer runtime, scope queue/read/health, rate limit, audit
   metadata, idempotency key, dan tool bounded wait.
@@ -52,6 +56,16 @@
 
 ### UI
 
+- Menambahkan blok Hasil terbaru di Dashboard yang menampilkan lima job terakhir beserta short link siap salin; halaman Riwayat tetap menjadi arsip lengkap.
+- Memperbaiki mode sidebar ikon agar label menu Dashboard, MCP, Pengaturan, dan Riwayat benar-benar tersembunyi secara visual saat sidebar diperkecil, sementara nama aksesibilitas tetap tersedia.
+- Memperbaiki sidebar yang dapat terbuka dalam mode ikon akibat preferensi lama; state collapse kini memakai kunci versi baru dan dashboard kembali expanded pada migrasi pertama.
+- Memperbaiki badge kosong pada menu Riwayat agar benar-benar tersembunyi ketika tidak ada job aktif.
+- Menambahkan badge jumlah job `queued` dan `running` pada menu Riwayat agar antrean aktif terlihat tanpa membuka halaman.
+- Menambahkan tombol Tes koneksi pada halaman MCP yang memeriksa listener dan respons endpoint melalui server lokal tanpa menampilkan token.
+- Menambahkan mode sidebar desktop yang dapat diperkecil menjadi ikon dan menyimpan pilihan pengguna di browser.
+- Menambahkan filter riwayat berdasarkan status serta rentang tanggal pembuatan, lengkap dengan ringkasan hasil dan reset filter.
+- Menata dashboard menjadi sidebar minimalis yang sticky di desktop dan berubah menjadi navigasi ringkas yang dapat digeser di layar kecil; Dashboard, MCP, Pengaturan, Riwayat, dan Keluar kini memiliki ruang yang jelas.
+- Memindahkan password superadmin dan tema ke halaman Pengaturan, memisahkan riwayat ke halaman Riwayat, serta menambahkan navigasi berbasis hash dengan state aktif yang tetap terbaca pembaca layar.
 - Memperkuat layout webapp pada viewport tablet dan mobile, termasuk wrapping URL/job,
   target sentuh minimum, grid satu kolom, dan fokus keyboard yang tetap terlihat.
 - Menambahkan halaman login superadmin, panel wajib ganti password awal, logout, dan

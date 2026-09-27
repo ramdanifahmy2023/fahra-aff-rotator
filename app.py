@@ -18,6 +18,7 @@ import uuid
 from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http import HTTPStatus
+from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ SHOPEE_PROFILE = SHOPEE_ORIGIN + "/api/v3/user/profile"
 PORT = int(os.getenv("PORT", "8788"))
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "8790"))
+MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", f"http://127.0.0.1:{MCP_PORT}/mcp")
 MCP_ALLOWED_NETWORKS = tuple(
     ipaddress.ip_network(item.strip(), strict=False)
     for item in os.getenv("MCP_ALLOWED_NETWORKS", "127.0.0.1/32,100.64.0.0/10,::1/128").split(",")
@@ -129,7 +131,8 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
   scopes_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   last_used_at TEXT,
-  revoked_at TEXT
+  revoked_at TEXT,
+  deleted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS mcp_audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,6 +178,9 @@ def init_db() -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency_key ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
         )
+        mcp_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mcp_tokens)").fetchall()}
+        if "deleted_at" not in mcp_columns:
+            conn.execute("ALTER TABLE mcp_tokens ADD COLUMN deleted_at TEXT")
         # A daemon restart must not leave a lease permanently stuck in running.
         conn.execute(
             "UPDATE jobs SET status='queued', updated_at=? WHERE status='running'",
@@ -255,48 +261,120 @@ def ensure_mcp_token() -> None:
     if len(token) < 32:
         raise RuntimeError(f"MCP token file tidak valid: {MCP_TOKEN_FILE}")
     hashed = token_hash(token)
-    scopes = json.dumps(["jobs:create", "jobs:read", "health:read"])
+    scopes = json.dumps(MCP_SCOPES)
     with db() as conn:
-        existing = conn.execute("SELECT id, token_hash FROM mcp_tokens WHERE name=?", (MCP_TOKEN_NAME,)).fetchone()
+        existing = conn.execute(
+            "SELECT id, token_hash, revoked_at, deleted_at FROM mcp_tokens WHERE name=?",
+            (MCP_TOKEN_NAME,),
+        ).fetchone()
         if existing is None:
             conn.execute(
                 """INSERT INTO mcp_tokens(name, token_hash, scopes_json, created_at)
                    VALUES (?, ?, ?, ?)""",
                 (MCP_TOKEN_NAME, hashed, scopes, now()),
             )
-        elif existing["token_hash"] != hashed:
+        elif existing["token_hash"] != hashed and not existing["deleted_at"]:
             conn.execute(
                 """UPDATE mcp_tokens
-                   SET token_hash=?, scopes_json=?, revoked_at=NULL
+                   SET token_hash=?, scopes_json=?
                    WHERE id=?""",
                 (hashed, scopes, existing["id"]),
             )
 
 
-def create_mcp_token(name: str) -> None:
+def clean_mcp_token_name(name: str) -> str:
     clean_name = str(name or "").strip()[:80]
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", clean_name):
         raise ValueError("Nama token hanya boleh berisi huruf, angka, titik, garis bawah, atau tanda minus")
+    return clean_name
+
+
+MCP_SCOPES = ["jobs:create", "jobs:read", "health:read"]
+
+
+def mcp_token_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    if row["deleted_at"]:
+        status = "deleted"
+    elif row["revoked_at"]:
+        status = "revoked"
+    else:
+        status = "active"
+    return {
+        "name": row["name"],
+        "scopes": json.loads(row["scopes_json"]),
+        "created_at": row["created_at"],
+        "last_used_at": row["last_used_at"],
+        "revoked_at": row["revoked_at"],
+        "deleted_at": row["deleted_at"],
+        "status": status,
+    }
+
+
+def issue_mcp_token(name: str) -> tuple[str, dict[str, Any]]:
+    clean_name = clean_mcp_token_name(name)
     token = secrets.token_urlsafe(48)
     with db() as conn:
-        try:
+        existing = conn.execute("SELECT * FROM mcp_tokens WHERE name=?", (clean_name,)).fetchone()
+        if existing and not existing["deleted_at"]:
+            raise RuntimeError(f"Token MCP sudah ada dan harus dicabut atau dihapus dahulu: {clean_name}")
+        if existing:
+            conn.execute(
+                """UPDATE mcp_tokens
+                   SET token_hash=?, scopes_json=?, created_at=?, last_used_at=NULL,
+                       revoked_at=NULL, deleted_at=NULL
+                   WHERE id=?""",
+                (token_hash(token), json.dumps(MCP_SCOPES), now(), existing["id"]),
+            )
+        else:
             conn.execute(
                 """INSERT INTO mcp_tokens(name, token_hash, scopes_json, created_at)
                    VALUES (?, ?, ?, ?)""",
-                (clean_name, token_hash(token), json.dumps(["jobs:create", "jobs:read", "health:read"]), now()),
+                (clean_name, token_hash(token), json.dumps(MCP_SCOPES), now()),
             )
-        except sqlite3.IntegrityError as exc:
-            raise RuntimeError(f"Token MCP sudah ada: {clean_name}") from exc
+        row = conn.execute("SELECT * FROM mcp_tokens WHERE name=?", (clean_name,)).fetchone()
+    return token, mcp_token_metadata(row)
+
+
+def create_mcp_token(name: str) -> None:
+    token, _ = issue_mcp_token(name)
     print(token)
 
 
 def revoke_mcp_token(name: str) -> None:
-    clean_name = str(name or "").strip()[:80]
+    clean_name = clean_mcp_token_name(name)
     with db() as conn:
-        result = conn.execute("UPDATE mcp_tokens SET revoked_at=? WHERE name=? AND revoked_at IS NULL", (now(), clean_name))
+        result = conn.execute(
+            """UPDATE mcp_tokens SET revoked_at=?
+               WHERE name=? AND revoked_at IS NULL AND deleted_at IS NULL""",
+            (now(), clean_name),
+        )
         if result.rowcount == 0:
             raise RuntimeError(f"Token MCP tidak ditemukan atau sudah dicabut: {clean_name}")
     print(f"Token MCP dicabut: {clean_name}")
+
+
+def delete_mcp_token(name: str) -> None:
+    clean_name = clean_mcp_token_name(name)
+    with db() as conn:
+        if clean_name == MCP_TOKEN_NAME:
+            deleted_at = now()
+            result = conn.execute(
+                """UPDATE mcp_tokens
+                   SET deleted_at=?, revoked_at=COALESCE(revoked_at, ?)
+                   WHERE name=? AND deleted_at IS NULL""",
+                (deleted_at, deleted_at, clean_name),
+            )
+        else:
+            result = conn.execute("DELETE FROM mcp_tokens WHERE name=?", (clean_name,))
+        if result.rowcount == 0:
+            raise RuntimeError(f"Token MCP tidak ditemukan atau sudah dihapus: {clean_name}")
+    print(f"Token MCP dihapus: {clean_name}")
+
+
+def list_mcp_tokens() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM mcp_tokens ORDER BY deleted_at IS NOT NULL, created_at DESC").fetchall()
+    return [mcp_token_metadata(row) for row in rows]
 
 
 def mcp_token_from_request(handler: BaseHTTPRequestHandler) -> sqlite3.Row | None:
@@ -309,7 +387,7 @@ def mcp_token_from_request(handler: BaseHTTPRequestHandler) -> sqlite3.Row | Non
         row = conn.execute(
             """SELECT id, name, token_hash, scopes_json
                FROM mcp_tokens
-               WHERE token_hash=? AND revoked_at IS NULL""",
+               WHERE token_hash=? AND revoked_at IS NULL AND deleted_at IS NULL""",
             (hashed,),
         ).fetchone()
         if row:
@@ -700,6 +778,41 @@ def health_summary() -> dict[str, Any]:
             "busy": BRIDGE_CURRENT is not None,
         }
     return {"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge}
+
+
+def probe_mcp_listener() -> dict[str, Any]:
+    parsed = urlparse(MCP_PUBLIC_URL)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return {"ok": False, "message": "MCP_PUBLIC_URL tidak valid."}
+    hostname = parsed.hostname
+    if hostname in {"0.0.0.0", "::", "[::]"}:
+        hostname = "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/mcp"
+    if parsed.query:
+        path += f"?{parsed.query}"
+    connection_class = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    connection = None
+    try:
+        connection = connection_class(hostname, port, timeout=3)
+        connection.request(
+            "POST",
+            path,
+            body=b'{"jsonrpc":"2.0","id":"dashboard-probe","method":"initialize","params":{}}',
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        response = connection.getresponse()
+        response.read(4096)
+        if response.status == HTTPStatus.UNAUTHORIZED:
+            return {"ok": True, "status": response.status, "message": "MCP aktif dan meminta Bearer token."}
+        if response.status == HTTPStatus.OK:
+            return {"ok": True, "status": response.status, "message": "MCP aktif dan endpoint merespons."}
+        return {"ok": False, "status": response.status, "message": f"Endpoint MCP merespons HTTP {response.status}."}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "message": f"MCP tidak terjangkau: {str(exc)[:160]}"}
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def wait_for_job(job_id: str, timeout_seconds: int) -> dict[str, Any] | None:
@@ -1124,6 +1237,25 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Login diperlukan"}, HTTPStatus.UNAUTHORIZED)
         return user
 
+    def require_mcp_admin(self) -> sqlite3.Row | None:
+        user = self.require_user()
+        if not user:
+            return None
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        if origin:
+            parsed_origin = urlparse(origin)
+            if parsed_origin.netloc.lower() != host.lower() or parsed_origin.scheme not in {"http", "https"}:
+                self.send_json({"error": "Origin request tidak cocok"}, HTTPStatus.FORBIDDEN)
+                return None
+        elif self.headers.get("Sec-Fetch-Site", "").lower() not in {"same-origin", "none", ""}:
+            self.send_json({"error": "Request lintas origin ditolak"}, HTTPStatus.FORBIDDEN)
+            return None
+        if user["must_change_password"]:
+            self.send_json({"error": "Ganti password terlebih dahulu"}, HTTPStatus.FORBIDDEN)
+            return None
+        return user
+
     def send_redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
@@ -1147,6 +1279,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             self.send_json(health_summary())
+            return
+        if parsed.path == "/api/mcp/tokens":
+            if not self.require_mcp_admin():
+                return
+            self.send_json({"mcp_url": MCP_PUBLIC_URL, "tokens": list_mcp_tokens()})
+            return
+        if parsed.path == "/api/mcp/test":
+            if not self.require_mcp_admin():
+                return
+            self.send_json(probe_mcp_listener())
             return
         if parsed.path == "/api/bridge/next":
             if not self.require_user():
@@ -1243,6 +1385,40 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        if parsed.path == "/api/mcp/test":
+            if not self.require_mcp_admin():
+                return
+            self.send_json(probe_mcp_listener())
+            return
+        if parsed.path == "/api/mcp/tokens":
+            if not self.require_mcp_admin():
+                return
+            try:
+                body = self.read_json()
+                name = body.get("name") if isinstance(body, dict) else ""
+                token, metadata = issue_mcp_token(name)
+                self.send_json(
+                    {
+                        "token": token,
+                        "token_metadata": metadata,
+                        "mcp_url": MCP_PUBLIC_URL,
+                        "warning": "Token ini hanya ditampilkan sekali. Simpan di secret manager atau environment client.",
+                    },
+                    HTTPStatus.CREATED,
+                )
+            except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path.startswith("/api/mcp/tokens/") and parsed.path.endswith("/revoke"):
+            if not self.require_mcp_admin():
+                return
+            name = parsed.path[len("/api/mcp/tokens/") : -len("/revoke")].strip("/")
+            try:
+                revoke_mcp_token(name)
+                self.send_json({"ok": True, "name": name, "status": "revoked"})
+            except (ValueError, RuntimeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/bridge/ping":
             if not self.require_user():
                 return
@@ -1272,6 +1448,20 @@ class Handler(BaseHTTPRequestHandler):
             job, reused = enqueue_job(self.read_json())
             self.send_json({"id": job["id"], "status": job["status"], "reused": reused}, HTTPStatus.ACCEPTED)
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/mcp/tokens/"):
+            self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        if not self.require_mcp_admin():
+            return
+        name = parsed.path[len("/api/mcp/tokens/") :].strip("/")
+        try:
+            delete_mcp_token(name)
+            self.send_json({"ok": True, "name": name, "status": "deleted"})
+        except (ValueError, RuntimeError) as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def send_html(self, html: str) -> None:
@@ -1316,14 +1506,61 @@ INDEX_HTML = r'''<!doctype html>
     [data-theme="light"] { color-scheme: light; --stage:#eee8de; --stage-2:#f8f4ec; --stage-line:rgba(36,31,26,.18); --light:#241f1a; --muted:#685f57; --line:#ded6ca; --accent:#b75b10; --warn:#8a4b16; --hover:#3b3028; }
     * { box-sizing:border-box; }
     body { margin:0; min-height:100vh; background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(233,132,37,.18),transparent 70%),var(--stage); color:var(--light); font:14px/1.5 var(--sans); }
-    main { width:min(1180px, calc(100% - 44px)); margin:0 auto 64px; }
-    header { position:relative; display:flex; justify-content:space-between; gap:24px; align-items:end; margin:0 -4px 34px; padding:24px 0 0; }
-    header::before { content:'FAHRA AFFILIATE ROTATOR'; position:absolute; top:24px; left:0; font:11px/1 var(--mono); letter-spacing:.16em; color:var(--muted); }
-    h1 { font:italic 700 clamp(2.4rem,5vw,4.8rem)/.98 var(--serif); letter-spacing:-.02em; margin:48px 0 12px; max-width:11ch; }
+    main { width:min(1360px, calc(100% - 44px)); margin:0 auto 64px; }
+    .app-shell { display:grid; grid-template-columns:220px minmax(0,1fr); gap:28px; align-items:start; padding-top:24px; transition:grid-template-columns .18s ease; }
+    .app-shell.sidebar-collapsed { grid-template-columns:72px minmax(0,1fr); }
+    .sidebar { position:sticky; top:24px; min-height:calc(100vh - 48px); display:flex; flex-direction:column; padding:18px 12px; border:1px solid var(--stage-line); border-radius:18px; background:rgba(26,23,20,.82); color:var(--light); }
+    .sidebar-head { display:flex; align-items:flex-start; gap:6px; padding:0 0 22px; }
+    .sidebar-brand { min-width:0; flex:1 1 auto; padding:4px 10px 0; font:11px/1.35 var(--mono); letter-spacing:.13em; color:var(--muted); }
+    .sidebar-brand strong { display:block; margin-top:7px; color:var(--light); font:italic 700 1.35rem/1 var(--serif); letter-spacing:0; }
+    .sidebar-toggle { flex:0 0 38px; width:38px !important; min-height:38px; margin:0; padding:8px !important; border:1px solid var(--stage-line); border-radius:9px; background:transparent; color:var(--muted); }
+    .sidebar-toggle:hover { background:var(--hover); color:var(--light); }
+    .sidebar-toggle svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .sidebar-collapsed .sidebar-head { display:block; }
+    .sidebar-collapsed .sidebar-brand { padding:4px 0 12px; text-align:center; }
+    .sidebar-collapsed .sidebar-brand strong, .sidebar-collapsed .sidebar-user, .sidebar-collapsed .sidebar-logout span { display:none; }
+    .sidebar-collapsed .sidebar-toggle { display:grid; place-items:center; margin:0 auto; }
+    .sidebar-collapsed .nav-item { position:relative; justify-content:center; padding-left:8px; padding-right:8px; }
+    .sidebar-collapsed .nav-label { display:none; }
+    .sidebar-collapsed .nav-badge:not([hidden]) { position:absolute; top:2px; right:2px; min-width:16px; height:16px; margin:0; padding:0 3px; font-size:.58rem; }
+    .sidebar-collapsed .sidebar-footer { padding-left:0; padding-right:0; }
+    .sidebar-collapsed .sidebar-logout { justify-content:center; padding-left:8px; padding-right:8px; }
+    .sidebar-nav { display:grid; gap:5px; }
+    .nav-item { display:flex; align-items:center; gap:10px; width:100%; min-height:44px; margin:0; padding:10px 11px; border:1px solid transparent; border-radius:10px; background:transparent; color:var(--muted); text-align:left; font:600 13px/1.2 var(--sans); cursor:pointer; }
+    .nav-item:hover { background:var(--hover); color:var(--light); }
+    .nav-item[aria-current="page"] { background:var(--light); color:var(--ink); }
+    .nav-item svg { width:17px; height:17px; flex:0 0 auto; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .sidebar-footer { display:grid; gap:10px; margin-top:auto; padding:18px 10px 2px; border-top:1px solid var(--stage-line); }
+    .sidebar-user { overflow:hidden; color:var(--muted); font:11px/1.35 var(--mono); text-overflow:ellipsis; white-space:nowrap; }
+    .sidebar-logout { display:flex; align-items:center; justify-content:flex-start; gap:9px; min-height:44px; margin:0; padding:9px 10px; border:1px solid var(--stage-line); border-radius:10px; background:transparent; color:var(--light); font:600 12px/1.2 var(--sans); }
+    .sidebar-logout:hover { background:var(--hover); }
+    .sidebar-logout svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .nav-badge { display:inline-grid; place-items:center; min-width:20px; height:20px; margin-left:auto; padding:0 5px; border-radius:999px; background:var(--accent); color:#241f1a; font:700 .68rem/1 var(--mono); }
+    .nav-badge[hidden] { display:none; }
+    .nav-item[aria-current="page"] .nav-badge { background:var(--ink); color:var(--light); }
+    .workspace { min-width:0; }
+    header { position:relative; display:flex; justify-content:space-between; gap:24px; align-items:end; margin:0 0 30px; padding:0; }
+    header::before { content:'FAHRA AFFILIATE ROTATOR'; position:absolute; top:0; left:0; font:11px/1 var(--mono); letter-spacing:.16em; color:var(--muted); }
+    h1 { font:italic 700 clamp(2.4rem,5vw,4.8rem)/.98 var(--serif); letter-spacing:-.02em; margin:44px 0 12px; max-width:11ch; }
     h1::first-line { color:var(--light); }
     .dek { max-width:580px; color:var(--muted); margin:0; font-size:15px; }
     .signal { min-width:0; flex:1 1 160px; padding:12px 14px; border:1px solid var(--stage-line); background:var(--stage-2); color:var(--light); border-radius:10px; font:12px/1.4 var(--mono); }
+    .view[hidden] { display:none; }
+    .view-heading { margin:0 0 20px; }
+    .view-heading h2 { margin-bottom:6px; }
+    .view-heading p { max-width:680px; }
+    .history-tools { display:grid; grid-template-columns:1.15fr repeat(2,minmax(150px,.8fr)) auto; gap:10px; align-items:end; margin:0 0 18px; padding:14px; border:1px solid var(--line); border-radius:12px; background:#faf6ee; }
+    .history-tools label { margin:0; color:var(--muted); font-size:.82rem; }
+    .history-tools select, .history-tools input { width:100%; min-height:42px; margin-top:5px; border:1px solid #cfc7bd; border-radius:8px; background:#fff; color:var(--ink); padding:9px 10px; font:inherit; }
+    .history-tools button { width:auto; min-height:42px; margin:0; padding:10px 14px; white-space:nowrap; }
+    .history-summary { min-height:20px; margin:-8px 0 12px; }
     .layout { display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr); gap:22px; align-items:start; }
+    .dashboard-stack { max-width:900px; }
+    .dashboard-card { max-width:820px; }
+    .recent-card { margin-top:22px; padding-top:22px; border-top:1px solid var(--line); }
+    .recent-heading { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+    .recent-heading h2 { margin-bottom:0; }
+    .recent-count { color:var(--muted); font:500 .76rem/1.2 var(--mono); }
     section { min-width:0; background:var(--paper); border:0; border-radius:18px; padding:24px; color:var(--ink); box-shadow:0 18px 40px rgba(0,0,0,.18); }
     h2 { font:700 1.15rem/1.2 var(--sans); margin:0 0 15px; }
     label { display:block; font-weight:650; margin:15px 0 6px; }
@@ -1348,8 +1585,12 @@ INDEX_HTML = r'''<!doctype html>
     .completed { color:#207044; } .failed,.needs_session { color:var(--error); } .queued,.running { color:var(--warn); }
     .result { min-width:0; margin-top:9px; display:grid; gap:6px; }
     .result > div { min-width:0; }
+    .short-link-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
     .result a { display:inline-block; max-width:100%; color:var(--accent); overflow-wrap:anywhere; }
     .result a.copied { color:#207044; }
+    .copy-link-action { width:auto; min-height:32px; margin:0; padding:7px 10px; border:1px solid var(--line); border-radius:8px; background:transparent; color:var(--ink); font-size:.78rem; }
+    .copy-link-action:hover { background:#f3eee6; }
+    .copy-link-action.copied { color:#207044; border-color:#8bb69d; }
     .copy-feedback { color:#207044; font-size:.8rem; margin-left:6px; }
     .error { color:var(--error); font-size:.9rem; }
     .empty { color:var(--muted); padding:22px 0; }
@@ -1361,19 +1602,73 @@ INDEX_HTML = r'''<!doctype html>
     .pagination button:disabled { opacity:.4; cursor:not-allowed; }
     .pagination .pagination-control { white-space:nowrap; }
     .header-tools { display:flex; flex:0 1 430px; align-items:center; gap:10px; }
-    .account { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; min-width:0; font-size:12px; color:var(--muted); }
-    .account-email { max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--light); font-weight:600; }
-    .account button { margin:0; width:auto; min-height:40px; padding:8px 12px; }
-    .account select { min-height:40px; max-width:112px; border:1px solid var(--stage-line); border-radius:8px; background:var(--stage-2); color:var(--light); padding:6px 8px; }
     .icon-button { width:44px !important; min-height:44px; padding:0 !important; display:inline-grid; place-items:center; border:1px solid var(--stage-line); background:var(--stage-2); color:var(--light); border-radius:10px; }
     .icon-button svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-    .password-panel { margin:0 0 22px; border:1px solid var(--line); border-radius:14px; padding:18px 20px; background:var(--paper); color:var(--ink); }
+    .password-panel { margin:0; border:1px solid var(--line); border-radius:14px; padding:18px 20px; background:var(--paper); color:var(--ink); }
     .password-panel[hidden] { display:none; }
     .password-panel button { width:100%; }
-    @media (max-width: 860px) {
-      main { width:min(100% - 32px, 680px); margin-top:24px; margin-bottom:48px; }
-      header { display:block; margin-bottom:26px; }
+    .mcp-panel { margin:0 0 22px; }
+    .mcp-panel fieldset { border:0; margin:0; padding:0; min-width:0; }
+    .mcp-panel fieldset:disabled { opacity:.58; }
+    .mcp-intro { max-width:760px; }
+    .mcp-heading { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+    .mcp-heading h2 { margin-bottom:0; }
+    .mcp-heading button { width:auto; margin:0; white-space:nowrap; }
+    .mcp-form { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:end; margin-top:16px; }
+    .mcp-form label { margin:0; }
+    .mcp-form button { width:auto; margin:0; white-space:nowrap; }
+    .mcp-message { min-height:22px; }
+    .mcp-reveal { margin-top:18px; padding:16px; border:1px solid #e6b77e; border-radius:12px; background:#fff7e9; }
+    .mcp-reveal[hidden] { display:none; }
+    .mcp-secret { display:flex; gap:8px; align-items:stretch; margin:10px 0; }
+    .mcp-secret code { flex:1 1 auto; min-width:0; overflow:auto; padding:11px 12px; border-radius:8px; background:#241f1a; color:#fff7e9; font:500 .82rem/1.4 var(--mono); overflow-wrap:anywhere; }
+    .mcp-secret button, .mcp-copy { width:auto; margin:0; white-space:nowrap; }
+    .mcp-configs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:12px; }
+    .mcp-config { min-width:0; border:1px solid #e3d8c9; border-radius:10px; padding:10px; background:#fffdf8; }
+    .mcp-config-head { display:flex; justify-content:space-between; gap:8px; align-items:center; font-weight:700; }
+    .mcp-config pre { max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0 0; font:500 .73rem/1.45 var(--mono); color:#3a3028; }
+    .mcp-config button { min-height:34px; padding:7px 10px; font-size:.78rem; margin:0; }
+    .mcp-list { display:grid; gap:9px; margin-top:17px; }
+    .mcp-token { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; border-top:1px solid var(--line); padding-top:12px; }
+    .mcp-token:first-child { border-top:0; padding-top:0; }
+    .mcp-token-name { font-weight:700; overflow-wrap:anywhere; }
+    .mcp-token-meta { color:var(--muted); font-size:.8rem; }
+    .mcp-token-actions { display:flex; flex-wrap:wrap; gap:7px; justify-content:flex-end; }
+    .mcp-token-actions button { width:auto; min-height:36px; margin:0; padding:8px 11px; font-size:.78rem; }
+    .mcp-token-actions .danger { background:var(--error); }
+    .mcp-token-actions .quiet { background:transparent; color:var(--ink); border:1px solid var(--line); }
+    .mcp-status { display:inline-block; margin-left:6px; font:500 .7rem/1 var(--mono); text-transform:uppercase; letter-spacing:.04em; }
+    .mcp-status.active { color:#207044; } .mcp-status.revoked,.mcp-status.deleted { color:var(--error); }
+    .settings-grid { display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:16px; align-items:start; }
+    .settings-card { min-width:0; }
+    .theme-card { min-width:0; }
+    .theme-card select { width:100%; min-height:44px; border:1px solid #cfc7bd; border-radius:8px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; }
+    @media (max-width: 980px) {
+      .app-shell { grid-template-columns:190px minmax(0,1fr); gap:20px; }
+      .settings-grid { grid-template-columns:1fr; }
+    }
+    @media (max-width: 760px) {
+      main { width:min(100% - 32px, 680px); margin-top:0; margin-bottom:48px; }
+      .app-shell { display:block; padding-top:12px; }
+      .sidebar { position:sticky; top:0; z-index:10; min-height:0; display:grid; grid-template-columns:auto minmax(0,1fr); gap:14px; align-items:center; padding:10px; border-radius:14px; }
+      .sidebar-head { display:block; padding:0; }
+      .sidebar-brand { padding:4px 8px; white-space:nowrap; }
+      .sidebar-brand strong { margin-top:4px; font-size:1.1rem; }
+      .sidebar-toggle { display:none; }
+      .sidebar-collapsed .sidebar-head { display:block; }
+      .sidebar-collapsed .sidebar-brand { padding:4px 8px; text-align:left; }
+      .sidebar-collapsed .sidebar-brand strong { display:block; }
+      .sidebar-collapsed .nav-item { position:relative; justify-content:center; padding:10px; }
+      .sidebar-collapsed .nav-label { display:none; }
+      .sidebar-collapsed .nav-badge:not([hidden]) { position:absolute; top:1px; right:1px; min-width:16px; height:16px; margin:0; padding:0 3px; font-size:.58rem; }
+      .sidebar-nav { display:flex; min-width:0; gap:4px; overflow-x:auto; scrollbar-width:none; }
+      .sidebar-nav::-webkit-scrollbar { display:none; }
+      .nav-item { flex:0 0 auto; width:auto; padding:10px; }
+      .nav-item .nav-label { display:none; }
+      .nav-item svg { width:18px; height:18px; }
+      .sidebar-footer { display:none; }
+      header { display:block; margin-bottom:26px; padding-top:0; }
       .signal { width:100%; margin-top:18px; }
       .header-tools { width:100%; margin-top:18px; align-items:stretch; }
       .layout { grid-template-columns:1fr; gap:16px; }
@@ -1388,15 +1683,24 @@ INDEX_HTML = r'''<!doctype html>
       textarea { min-height:132px; }
       .tags { grid-template-columns:repeat(2,minmax(0,1fr)); }
       button { width:100%; margin-top:16px; }
+      .copy-link-action { width:auto; margin:0; }
       .pagination { flex-wrap:wrap; }
       .pagination button { width:auto; margin-top:0; }
       .pagination .pagination-control { flex:1 1 calc(50% - 5px); }
       .pagination-list { order:3; flex-basis:100%; }
       .header-tools { display:flex; flex-wrap:wrap; }
       .signal { flex:1 1 100%; }
-      .account { width:100%; justify-content:space-between; }
-      .account-email { flex:1 1 100%; max-width:none; }
-      .account select { flex:1 1 100px; max-width:none; }
+      .mcp-form { grid-template-columns:1fr; }
+      .mcp-form button { width:100%; }
+      .mcp-heading { align-items:flex-start; }
+      .mcp-heading button { width:auto; }
+      .history-tools { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .history-tools button { width:100%; }
+      .mcp-configs { grid-template-columns:1fr; }
+      .mcp-secret { display:grid; }
+      .mcp-secret button { width:100%; }
+      .mcp-token { grid-template-columns:1fr; }
+      .mcp-token-actions { justify-content:flex-start; }
     }
     @media (max-width: 380px) {
       main { width:calc(100% - 20px); }
@@ -1408,14 +1712,25 @@ INDEX_HTML = r'''<!doctype html>
   </style>
 </head>
 <body>
-<main>
+<main class="app-shell">
+  <aside class="sidebar" aria-label="Navigasi utama">
+    <div class="sidebar-head"><div class="sidebar-brand">FAHRA<strong>Affiliate Rotator</strong></div><button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Perkecil sidebar" aria-expanded="true" aria-controls="main-navigation" title="Perkecil sidebar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5 16 12 9 19"/></svg></button></div>
+    <nav id="main-navigation" class="sidebar-nav">
+      <button class="nav-item" type="button" data-view-target="dashboard" aria-label="Dashboard" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></svg><span class="nav-label">Dashboard</span></button>
+      <button class="nav-item" type="button" data-view-target="mcp" aria-label="MCP"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12h8"/><path d="M9.5 7.5 7 10a2.8 2.8 0 0 0 0 4l2.5 2.5"/><path d="m14.5 7.5 2.5 2.5a2.8 2.8 0 0 1 0 4l-2.5 2.5"/></svg><span class="nav-label">MCP</span></button>
+      <button class="nav-item" type="button" data-view-target="settings" aria-label="Pengaturan"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z"/><path d="m19 13.5 1.2 1-.9 1.6-1.5-.5a7.5 7.5 0 0 1-1.6 1l-.2 1.6h-2l-.5-1.5a7.4 7.4 0 0 1-2-.1L10.6 19l-1.8-.8.3-1.6a7.5 7.5 0 0 1-1.5-1.4l-1.5.3-.8-1.8 1.3-1a7.4 7.4 0 0 1 0-2l-1.3-1 .8-1.8 1.6.4a7.5 7.5 0 0 1 1.5-1.5L8.9 5l1.8-.8 1 1.3a7.5 7.5 0 0 1 2-.1l.6-1.5h2l.2 1.6a7.5 7.5 0 0 1 1.6 1l1.5-.5.9 1.6-1.2 1a7.4 7.4 0 0 1 .5 1.9l1.5.7-.3 2-1.6.2a7.4 7.4 0 0 1-.4 1.1Z"/></svg><span class="nav-label">Pengaturan</span></button>
+      <button id="history-nav" class="nav-item" type="button" data-view-target="history" aria-label="Riwayat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg><span class="nav-label">Riwayat</span><span id="history-badge" class="nav-badge" hidden></span></button>
+    </nav>
+    <div class="sidebar-footer"><div id="account-email" class="sidebar-user">Superadmin</div><button id="logout" class="sidebar-logout" type="button" aria-label="Keluar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg><span>Keluar</span></button></div>
+  </aside>
+  <div class="workspace">
   <header>
-    <div><h1>Buat link yang <span style="color:var(--accent)">bekerja.</span></h1><p class="dek">Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.</p></div>
-  <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div><div class="account"><span id="account-email" class="account-email">Superadmin</span><select id="theme-select" aria-label="Tema tampilan"><option value="system">Sistem</option><option value="light">Terang</option><option value="dark">Gelap</option></select><button id="password-toggle" class="icon-button" type="button" aria-label="Edit password" title="Edit password" aria-expanded="false" aria-controls="password-panel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z"/><path d="m14 7 3 3"/></svg><span class="sr-only">Edit password</span></button><button id="logout" class="icon-button" type="button" aria-label="Keluar" title="Keluar"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h4"/><path d="m14 8 4 4-4 4"/><path d="M18 12H9"/></svg><span class="sr-only">Keluar</span></button></div></div>
+    <div><h1 id="view-title">Buat link yang bekerja.</h1><p id="view-dek" class="dek">Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.</p></div>
+    <div class="header-tools"><div class="signal" id="health" role="status">Memeriksa worker...</div></div>
   </header>
-  <section id="password-panel" class="password-panel" hidden aria-labelledby="password-title"><h2 id="password-title">Ganti password</h2><p id="password-hint" class="hint">Masukkan password saat ini dan password baru.</p><form id="password-form"><label for="current-password">Password saat ini</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Password baru</label><input id="new-password" type="password" autocomplete="new-password" minlength="12" required><label for="new-password-confirmation">Ulangi password baru</label><input id="new-password-confirmation" type="password" autocomplete="new-password" minlength="12" required><button type="submit">Simpan password</button><p id="password-message" class="hint" role="status"></p></form></section>
-  <div class="layout">
-    <section aria-labelledby="create-title">
+  <section id="view-dashboard" class="view" data-view="dashboard" aria-labelledby="create-title">
+    <div class="dashboard-stack">
+    <div class="dashboard-card">
       <h2 id="create-title">Buat batch link</h2>
       <form id="job-form">
         <label for="links">URL Shopee</label>
@@ -1433,13 +1748,76 @@ INDEX_HTML = r'''<!doctype html>
         <button id="submit" type="submit" disabled>Masukkan ke worker</button>
         <p id="form-message" class="hint" role="status"></p>
       </form>
-    </section>
-    <section aria-labelledby="jobs-title">
-      <h2 id="jobs-title">Job terakhir</h2>
-      <div id="jobs" class="jobs"><p class="empty">Belum ada job.</p></div>
-      <nav id="jobs-pagination" class="pagination" aria-label="Navigasi riwayat job"></nav>
-    </section>
+    </div>
+    <div class="recent-card" aria-labelledby="recent-title">
+      <div class="recent-heading"><h2 id="recent-title">Hasil terbaru</h2><span id="recent-count" class="recent-count"></span></div>
+      <p class="hint">Lima job terakhir tampil di sini agar short link mudah disalin. Riwayat menyimpan daftar lengkap.</p>
+      <div id="recent-jobs" class="jobs"><p class="empty">Memuat hasil terbaru...</p></div>
+    </div>
+    </div>
+  </section>
+  <section id="view-history" class="view" data-view="history" aria-labelledby="jobs-title" hidden>
+    <div class="view-heading"><h2 id="jobs-title">Riwayat job</h2><p class="hint">Pantau status dan salin short link dari pekerjaan yang sudah dikirim.</p></div>
+    <form id="history-filters" class="history-tools" aria-label="Filter riwayat job">
+      <label for="history-status">Status<select id="history-status"><option value="all">Semua status</option><option value="queued">Queued</option><option value="running">Running</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="needs_session">Needs session</option></select></label>
+      <label for="history-from">Dari tanggal<input id="history-from" type="date"></label>
+      <label for="history-to">Sampai tanggal<input id="history-to" type="date"></label>
+      <button id="history-reset" type="button">Reset filter</button>
+    </form>
+    <p id="history-summary" class="hint history-summary" role="status"></p>
+    <div id="jobs" class="jobs"><p class="empty">Belum ada job.</p></div>
+    <nav id="jobs-pagination" class="pagination" aria-label="Navigasi riwayat job"></nav>
+  </section>
+  <section id="view-mcp" class="view" data-view="mcp" aria-labelledby="mcp-title" hidden>
+  <div id="mcp-panel" class="mcp-panel">
+    <div class="mcp-heading"><h2 id="mcp-title">Akses MCP</h2><button id="mcp-test" class="quiet" type="button">Tes koneksi</button></div>
+    <p class="hint mcp-intro">Buat token terpisah untuk setiap OpenClaw, Codex, Claude, atau Hermes Agent. Plaintext hanya muncul sekali dan tidak disimpan di browser.</p>
+    <fieldset id="mcp-fieldset">
+      <form id="mcp-form" class="mcp-form">
+        <label for="mcp-name">Nama client<input id="mcp-name" name="name" required pattern="[A-Za-z0-9._-]{1,80}" placeholder="misalnya codex-laptop" autocomplete="off"></label>
+        <button type="submit">Generate token</button>
+      </form>
+    </fieldset>
+    <p id="mcp-message" class="hint mcp-message" role="status"></p>
+    <div id="mcp-reveal" class="mcp-reveal" hidden>
+      <strong>Token baru hanya ditampilkan sekarang.</strong>
+      <div class="mcp-secret"><code id="mcp-secret-value"></code><button id="mcp-copy-secret" type="button">Salin token</button></div>
+      <p class="hint">Simpan ke environment atau secret manager client sebelum menutup panel ini.</p>
+      <div id="mcp-configs" class="mcp-configs"></div>
+    </div>
+    <div id="mcp-tokens" class="mcp-list"><p class="empty">Memuat token...</p></div>
   </div>
+  </section>
+  <section id="view-settings" class="view" data-view="settings" aria-labelledby="settings-title" hidden>
+    <div class="view-heading"><h2 id="settings-title">Pengaturan</h2><p class="hint">Kelola akses akun dan preferensi tampilan dashboard.</p></div>
+    <div class="settings-grid">
+      <section id="password-panel" class="password-panel" aria-labelledby="password-title">
+        <h2 id="password-title">Password superadmin</h2>
+        <p id="password-hint" class="hint">Masukkan password saat ini dan password baru.</p>
+        <form id="password-form">
+          <label for="current-password">Password saat ini</label>
+          <input id="current-password" type="password" autocomplete="current-password" required>
+          <label for="new-password">Password baru</label>
+          <input id="new-password" type="password" autocomplete="new-password" minlength="12" required>
+          <label for="new-password-confirmation">Ulangi password baru</label>
+          <input id="new-password-confirmation" type="password" autocomplete="new-password" minlength="12" required>
+          <button type="submit">Simpan password</button>
+          <p id="password-message" class="hint" role="status"></p>
+        </form>
+      </section>
+      <section class="theme-card" aria-labelledby="theme-title">
+        <h2 id="theme-title">Tema tampilan</h2>
+        <p class="hint">Pilih tampilan yang nyaman untuk sesi ini.</p>
+        <label class="sr-only" for="theme-select">Tema tampilan</label>
+        <select id="theme-select">
+          <option value="system">Sistem</option>
+          <option value="light">Terang</option>
+          <option value="dark">Gelap</option>
+        </select>
+      </section>
+    </div>
+  </section>
+</div>
 </main>
 <script>
 const $ = (s) => document.querySelector(s);
@@ -1447,7 +1825,48 @@ const JOBS_PER_PAGE = 5;
 let jobsCache = [];
 let currentPage = 1;
 let currentUser = null;
-let passwordPanelOpen = false;
+let mcpUrl = '';
+let mcpRevealToken = '';
+const SIDEBAR_PREF_KEY = 'fahra-sidebar-collapsed-v2';
+if (localStorage.getItem('fahra-sidebar-collapsed') !== null && localStorage.getItem(SIDEBAR_PREF_KEY) === null) localStorage.removeItem('fahra-sidebar-collapsed');
+let sidebarCollapsed = localStorage.getItem(SIDEBAR_PREF_KEY) === '1';
+const mcpClientLabels = { openclaw: 'OpenClaw', codex: 'Codex CLI', claude: 'Claude / Claude Code', hermes: 'Hermes Agent' };
+const viewMeta = {
+  dashboard: { title: 'Buat link yang bekerja.', dek: 'Masukkan sampai lima URL produk atau halaman Shopee, beri tag pelacakan, lalu biarkan worker mengantrekan hasilnya.' },
+  mcp: { title: 'Akses MCP.', dek: 'Kelola token dan koneksi client untuk OpenClaw, Codex, Claude, dan Hermes.' },
+  settings: { title: 'Pengaturan.', dek: 'Atur password superadmin dan tema tampilan dashboard.' },
+  history: { title: 'Riwayat job.', dek: 'Pantau status pekerjaan dan salin short link yang sudah selesai.' }
+};
+function showView(view) {
+  if (!viewMeta[view]) view = 'dashboard';
+  document.querySelectorAll('[data-view]').forEach((element) => { element.hidden = element.dataset.view !== view; });
+  document.querySelectorAll('[data-view-target]').forEach((element) => {
+    if (element.dataset.viewTarget === view) element.setAttribute('aria-current', 'page');
+    else element.removeAttribute('aria-current');
+  });
+  $('#view-title').textContent = viewMeta[view].title;
+  $('#view-dek').textContent = viewMeta[view].dek;
+  if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
+}
+function applySidebarState() {
+  const shell = document.querySelector('.app-shell');
+  const toggle = $('#sidebar-toggle');
+  shell.classList.toggle('sidebar-collapsed', sidebarCollapsed);
+  toggle.setAttribute('aria-expanded', String(!sidebarCollapsed));
+  toggle.setAttribute('aria-label', sidebarCollapsed ? 'Perlebar sidebar' : 'Perkecil sidebar');
+  toggle.title = sidebarCollapsed ? 'Perlebar sidebar' : 'Perkecil sidebar';
+  toggle.innerHTML = sidebarCollapsed
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>';
+}
+function updateHistoryBadge() {
+  const activeCount = jobsCache.filter((job) => ['queued', 'running'].includes(job.status)).length;
+  const badge = $('#history-badge');
+  const nav = $('#history-nav');
+  badge.hidden = activeCount === 0;
+  badge.textContent = activeCount ? (activeCount > 99 ? '99+' : String(activeCount)) : '';
+  nav.setAttribute('aria-label', activeCount ? `Riwayat, ${activeCount} job aktif` : 'Riwayat');
+}
 function applyTheme(value) {
   value = normalizeTheme(value);
   localStorage.setItem('fahra-theme', value);
@@ -1468,16 +1887,49 @@ async function api(url, options = {}) {
 }
 function updatePasswordLock() {
   const locked = Boolean(currentUser?.must_change_password);
-  $('#password-panel').hidden = !locked && !passwordPanelOpen;
-  const passwordToggle = $('#password-toggle');
-  const passwordAction = locked ? 'Password wajib diubah' : (passwordPanelOpen ? 'Tutup password' : 'Edit password');
-  passwordToggle.disabled = locked;
-  passwordToggle.setAttribute('aria-label', passwordAction);
-  passwordToggle.setAttribute('title', passwordAction);
-  passwordToggle.setAttribute('aria-expanded', String(locked || passwordPanelOpen));
+  $('#password-panel').hidden = false;
   $('#password-hint').textContent = locked ? 'Untuk keamanan, ganti password bootstrap sebelum membuat job.' : 'Masukkan password saat ini dan password baru.';
   $('#job-form').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = locked; });
-  if (locked) $('#form-message').textContent = 'Ganti password awal di atas untuk membuka pembuatan job.';
+  $('#mcp-fieldset').disabled = locked;
+  $('#mcp-test').disabled = locked;
+  $('#mcp-tokens').querySelectorAll('button').forEach(control => { control.disabled = locked; });
+  if (locked) $('#mcp-message').textContent = 'Ganti password awal sebelum membuat atau mengelola token MCP.';
+  if (locked) $('#form-message').textContent = 'Ganti password awal di Pengaturan untuk membuka pembuatan job.';
+}
+function formatMcpDate(value) { return value ? new Date(value).toLocaleString('id-ID') : 'Belum pernah'; }
+function mcpSnippet(kind, token) {
+  const url = mcpUrl || `${location.protocol}//${location.hostname}:8790/mcp`;
+  const env = 'FAHRA_AFF_MCP_TOKEN';
+  if (kind === 'openclaw') return JSON.stringify({ mcp: { servers: { 'fahra-aff-rotator': { transport: 'streamable-http', url, headers: { Authorization: 'Bearer ${FAHRA_AFF_MCP_TOKEN}' } } } } }, null, 2);
+  if (kind === 'codex') return `# Save the token in your OS secret store, then export it before starting Codex.\nexport ${env}='<paste token>'\ncodex mcp add fahra-aff-rotator --url '${url}' --bearer-token-env-var ${env}`;
+  if (kind === 'claude') return JSON.stringify({ mcpServers: { 'fahra-aff-rotator': { type: 'http', url, headers: { Authorization: 'Bearer ${FAHRA_AFF_MCP_TOKEN}' } } } }, null, 2) + `\n\n# Set ${env} in your shell or secret manager before starting Claude Code.`;
+  return `# ~/.hermes/config.yaml\nmcp_servers:\n  fahra-aff-rotator:\n    url: '${url}'\n    headers:\n      Authorization: 'Bearer ${'${FAHRA_AFF_MCP_TOKEN}'}'\n\n# Add ${env}=<paste token> to ~/.hermes/.env.`;
+}
+function renderMcpConfigs(token) {
+  $('#mcp-configs').innerHTML = Object.entries(mcpClientLabels).map(([kind, label]) => `<article class="mcp-config"><div class="mcp-config-head"><span>${escapeHtml(label)}</span><button class="mcp-copy" type="button" data-mcp-copy="${escapeHtml(kind)}">Salin</button></div><pre id="mcp-snippet-${escapeHtml(kind)}"></pre></article>`).join('');
+  Object.keys(mcpClientLabels).forEach(kind => { $(`#mcp-snippet-${kind}`).textContent = mcpSnippet(kind, token); });
+}
+function showMcpToken(token) {
+  mcpRevealToken = token;
+  $('#mcp-secret-value').textContent = token;
+  renderMcpConfigs(token);
+  $('#mcp-reveal').hidden = false;
+  $('#mcp-reveal').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function renderMcpTokens(tokens) {
+  const container = $('#mcp-tokens');
+  if (!tokens.length) { container.innerHTML = '<p class="empty">Belum ada token MCP.</p>'; return; }
+  const lockedAttribute = currentUser?.must_change_password ? ' disabled' : '';
+  container.innerHTML = tokens.map(token => {
+    const isActive = token.status === 'active';
+    const action = isActive ? `<button type="button"${lockedAttribute} data-mcp-action="revoke" data-mcp-name="${escapeHtml(token.name)}">Cabut akses</button>` : '';
+    return `<article class="mcp-token"><div><div class="mcp-token-name">${escapeHtml(token.name)}<span class="mcp-status ${escapeHtml(token.status)}">${escapeHtml(token.status)}</span></div><div class="mcp-token-meta">Dibuat ${escapeHtml(formatMcpDate(token.created_at))} · Terakhir dipakai ${escapeHtml(formatMcpDate(token.last_used_at))}</div></div><div class="mcp-token-actions">${action}<button class="danger" type="button"${lockedAttribute} data-mcp-action="delete" data-mcp-name="${escapeHtml(token.name)}">Hapus</button></div></article>`;
+  }).join('');
+}
+async function loadMcpTokens() {
+  const data = await api('/api/mcp/tokens');
+  mcpUrl = data.mcp_url || mcpUrl;
+  renderMcpTokens(Array.isArray(data.tokens) ? data.tokens : []);
 }
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function sourceLabel(value) {
@@ -1489,7 +1941,7 @@ function sourceLabel(value) {
   }
 }
 function renderJob(job) {
-  const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div><span>${i + 1}. </span><a class="copy-link" href="${escapeHtml(row.shortLink)}" data-copy="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer" aria-label="Salin short link ${escapeHtml(row.shortLink)}">${escapeHtml(row.shortLink)}</a><span class="copy-feedback" role="status" aria-live="polite"></span></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
+  const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div class="short-link-row"><span>${i + 1}. </span><a class="copy-link" href="${escapeHtml(row.shortLink)}" data-copy="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer" aria-label="Salin short link ${escapeHtml(row.shortLink)}">${escapeHtml(row.shortLink)}</a><button class="copy-link-action" type="button" data-copy="${escapeHtml(row.shortLink)}" aria-label="Salin ${escapeHtml(row.shortLink)}">Salin</button><span class="copy-feedback" role="status" aria-live="polite"></span></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
   const source = String(job.links?.[0] || '');
   return `<article class="job"><div class="job-head"><div><a class="job-source" href="${escapeHtml(source)}" target="_blank" rel="noreferrer" title="${escapeHtml(source)}" aria-label="Buka URL sumber: ${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</a><div class="job-id">${escapeHtml(job.id)}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
 }
@@ -1500,13 +1952,36 @@ function renderPagination() {
   const pages = Array.from({length: pageCount}, (_, i) => i + 1).map(page => `<button type="button" data-page="${page}"${page === currentPage ? ' aria-current="page"' : ''} aria-label="Halaman ${page}">${page}</button>`).join('');
   pagination.innerHTML = `<button class="pagination-control" type="button" data-page="${currentPage - 1}"${currentPage === 1 ? ' disabled' : ''}>Sebelumnya</button><div class="pagination-list">${pages}</div><button class="pagination-control" type="button" data-page="${currentPage + 1}"${currentPage === pageCount ? ' disabled' : ''}>Berikutnya</button>`;
 }
+function filteredJobs() {
+  const status = $('#history-status').value;
+  const from = $('#history-from').value;
+  const to = $('#history-to').value;
+  return jobsCache.filter((job) => {
+    if (status !== 'all' && job.status !== status) return false;
+    const date = String(job.created_at || '').slice(0, 10);
+    if (from && date < from) return false;
+    if (to && date > to) return false;
+    return true;
+  });
+}
 function renderJobs() {
-  const pageCount = Math.ceil(jobsCache.length / JOBS_PER_PAGE);
+  const matchingJobs = filteredJobs();
+  const pageCount = Math.ceil(matchingJobs.length / JOBS_PER_PAGE);
   currentPage = Math.min(Math.max(currentPage, 1), Math.max(pageCount, 1));
   const start = (currentPage - 1) * JOBS_PER_PAGE;
-  const visibleJobs = jobsCache.slice(start, start + JOBS_PER_PAGE);
-  $('#jobs').innerHTML = visibleJobs.length ? visibleJobs.map(renderJob).join('') : '<p class="empty">Belum ada job. Kirim URL pertama untuk memulai.</p>';
+  const visibleJobs = matchingJobs.slice(start, start + JOBS_PER_PAGE);
+  $('#jobs').innerHTML = visibleJobs.length ? visibleJobs.map(renderJob).join('') : `<p class="empty">${jobsCache.length ? 'Tidak ada job yang cocok dengan filter.' : 'Belum ada job. Kirim URL pertama untuk memulai.'}</p>`;
+  $('#history-summary').textContent = matchingJobs.length === jobsCache.length
+    ? `${jobsCache.length} job tersedia.`
+    : `${matchingJobs.length} dari ${jobsCache.length} job cocok dengan filter.`;
   renderPagination();
+}
+function renderRecentJobs() {
+  const recentJobs = jobsCache.slice(0, 5);
+  $('#recent-count').textContent = recentJobs.length ? `${recentJobs.length} terbaru` : '';
+  $('#recent-jobs').innerHTML = recentJobs.length
+    ? recentJobs.map(renderJob).join('')
+    : '<p class="empty">Belum ada hasil. Kirim URL pertama untuk memulai.</p>';
 }
 async function copyText(value) {
   try {
@@ -1548,12 +2023,19 @@ async function refresh() {
   applyTheme(localStorage.getItem('fahra-theme') || 'system');
   $('#health').textContent = health.worker ? (health.bridge?.connected ? 'Bridge aktif' : 'Menunggu extension') : 'Worker berhenti';
   jobsCache = Array.isArray(jobs.jobs) ? jobs.jobs : [];
+  updateHistoryBadge();
   updatePasswordLock();
   renderJobs();
+  renderRecentJobs();
+  try { await loadMcpTokens(); } catch (error) { if (!currentUser?.must_change_password) $('#mcp-message').textContent = error.message; }
 }
+applySidebarState();
+$('#sidebar-toggle').addEventListener('click', () => { sidebarCollapsed = !sidebarCollapsed; localStorage.setItem(SIDEBAR_PREF_KEY, sidebarCollapsed ? '1' : '0'); applySidebarState(); });
+document.querySelectorAll('[data-view-target]').forEach((button) => button.addEventListener('click', () => showView(button.dataset.viewTarget)));
+window.addEventListener('hashchange', () => showView(location.hash.slice(1)));
 $('#theme-select').addEventListener('change', () => applyTheme($('#theme-select').value));
 applyTheme(localStorage.getItem('fahra-theme') || 'system');
-$('#password-toggle').addEventListener('click', () => { if (currentUser?.must_change_password) return; const wasOpen = passwordPanelOpen; passwordPanelOpen = !passwordPanelOpen; if (wasOpen && !passwordPanelOpen) { $('#current-password').value = ''; $('#new-password').value = ''; $('#new-password-confirmation').value = ''; $('#password-message').textContent = ''; } updatePasswordLock(); if (passwordPanelOpen) $('#current-password').focus(); });
+showView(location.hash.slice(1) || 'dashboard');
 $('#logout').addEventListener('click', async () => { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); location.href = '/login'; });
 $('#password-form').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -1564,9 +2046,62 @@ $('#password-form').addEventListener('submit', async (event) => {
     await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ current_password: $('#current-password').value, new_password: $('#new-password').value, new_password_confirmation: $('#new-password-confirmation').value }) });
     $('#current-password').value = ''; $('#new-password').value = ''; $('#new-password-confirmation').value = '';
     message.textContent = 'Password tersimpan. Pembuatan job sudah dibuka.';
-    passwordPanelOpen = false;
     await refresh();
   } catch (error) { message.textContent = error.message; } finally { button.disabled = false; }
+});
+$('#mcp-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = event.target.querySelector('button');
+  const message = $('#mcp-message');
+  button.disabled = true; message.textContent = 'Membuat token...';
+  try {
+    const data = await api('/api/mcp/tokens', { method: 'POST', body: JSON.stringify({ name: $('#mcp-name').value.trim() }) });
+    $('#mcp-name').value = '';
+    message.textContent = 'Token dibuat. Simpan sekarang karena plaintext tidak akan ditampilkan lagi.';
+    showMcpToken(data.token);
+    await loadMcpTokens();
+  } catch (error) { message.textContent = error.message; } finally { button.disabled = false; }
+});
+$('#mcp-test').addEventListener('click', async () => {
+  const button = $('#mcp-test');
+  const message = $('#mcp-message');
+  button.disabled = true;
+  message.textContent = 'Memeriksa koneksi MCP...';
+  try {
+    const data = await api('/api/mcp/test', { method: 'POST' });
+    message.textContent = data.message || 'MCP aktif.';
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    button.disabled = Boolean(currentUser?.must_change_password);
+  }
+});
+$('#mcp-copy-secret').addEventListener('click', async () => {
+  const copied = await copyText(mcpRevealToken);
+  $('#mcp-message').textContent = copied ? 'Token tersalin.' : 'Salin token dari kotak di atas secara manual.';
+});
+$('#mcp-configs').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-mcp-copy]');
+  if (!button) return;
+  const kind = button.dataset.mcpCopy;
+  const copied = await copyText(mcpSnippet(kind, mcpRevealToken));
+  button.textContent = copied ? 'Tersalin' : 'Salin';
+  window.setTimeout(() => { button.textContent = 'Salin'; }, 1800);
+});
+$('#mcp-tokens').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-mcp-action]');
+  if (!button) return;
+  const name = button.dataset.mcpName;
+  const action = button.dataset.mcpAction;
+  const prompt = action === 'revoke' ? `Cabut akses token "${name}" sekarang?` : `Hapus token "${name}" secara permanen dari daftar?`;
+  if (!window.confirm(prompt)) return;
+  button.disabled = true;
+  try {
+    await api(`/api/mcp/tokens/${encodeURIComponent(name)}${action === 'revoke' ? '/revoke' : ''}`, { method: action === 'revoke' ? 'POST' : 'DELETE' });
+    $('#mcp-message').textContent = action === 'revoke' ? 'Akses token dicabut.' : 'Token dihapus dan aksesnya dicabut.';
+    if (mcpRevealToken) { $('#mcp-reveal').hidden = true; mcpRevealToken = ''; }
+    await loadMcpTokens();
+  } catch (error) { $('#mcp-message').textContent = error.message; button.disabled = false; }
 });
 $('#jobs-pagination').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-page]');
@@ -1574,13 +2109,31 @@ $('#jobs-pagination').addEventListener('click', (event) => {
   currentPage = Number(button.dataset.page);
   renderJobs();
 });
-$('#jobs').addEventListener('click', async (event) => {
-  const link = event.target.closest('a.copy-link');
+$('#history-filters').addEventListener('submit', (event) => event.preventDefault());
+['history-status', 'history-from', 'history-to'].forEach((id) => {
+  ['input', 'change'].forEach((eventName) => $(`#${id}`).addEventListener(eventName, () => { currentPage = 1; renderJobs(); }));
+});
+$('#history-reset').addEventListener('click', () => {
+  $('#history-status').value = 'all';
+  $('#history-from').value = '';
+  $('#history-to').value = '';
+  currentPage = 1;
+  renderJobs();
+});
+async function handleJobCopy(event) {
+  const link = event.target.closest('a.copy-link, button.copy-link-action');
   if (!link) return;
-  event.preventDefault();
+  if (link.tagName === 'A') event.preventDefault();
   const copied = await copyText(link.dataset.copy || link.textContent.trim());
   showCopyFeedback(link, copied ? 'Link tersalin' : 'Salin manual dari link ini', copied);
-});
+  if (link.classList.contains('copy-link-action')) {
+    link.textContent = copied ? 'Tersalin' : 'Salin';
+    window.clearTimeout(link.copyLabelTimer);
+    link.copyLabelTimer = window.setTimeout(() => { link.textContent = 'Salin'; }, 2200);
+  }
+}
+$('#jobs').addEventListener('click', handleJobCopy);
+$('#recent-jobs').addEventListener('click', handleJobCopy);
 $('#job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const button = $('#submit'); button.disabled = true; $('#form-message').textContent = 'Menyimpan job...';
   const tags = [1,2,3,4,5].map(i => event.target.elements[`tag${i}`].value.trim());

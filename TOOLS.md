@@ -68,6 +68,7 @@ direstart. Setelah restart, cek kembali health dan database.
 | `SHOPEE_REQUEST_HEADERS_FILE` | Header hasil capture fallback; jangan commit |
 | `SHOPEE_BROWSER_PROFILE` | Profile fallback browser; jangan commit |
 | `MCP_HOST` / `MCP_PORT` | Bind MCP terpisah dari webapp; LaunchAgent memakai Tailscale IP dan port 8790 |
+| `MCP_PUBLIC_URL` | URL `/mcp` yang disalin ke konfigurasi client; gunakan alamat Tailscale/HTTPS yang benar-benar dapat dijangkau client |
 | `MCP_ALLOWED_NETWORKS` | Allowlist sumber MCP, default loopback dan Tailscale `100.64.0.0/10` |
 | `MCP_TOKEN_FILE` | File token MCP mode 0600; token plaintext tidak boleh masuk Git atau log |
 | `MCP_MAX_WAIT_SECONDS` | Batas tunggu tool MCP, maksimum 300 detik |
@@ -180,6 +181,30 @@ dicabut sebelum membuat token pengganti:
 ```sh
 /opt/homebrew/bin/python3 app.py --revoke-mcp-token nama-agent
 ```
+
+### Manajemen token melalui dashboard
+
+Setelah login dan mengganti password bootstrap, buka menu **MCP** pada sidebar dashboard.
+Gunakan nama token yang menjelaskan client, misalnya `openclaw-mac`, `codex-laptop`,
+`claude-desktop`, atau `hermes-agent`. Token plaintext hanya dikembalikan satu kali
+saat dibuat; daftar token berikutnya hanya menampilkan nama, scope, waktu dibuat,
+waktu terakhir dipakai, dan status. Simpan token pada environment atau secret manager
+client, jangan di repository atau localStorage.
+
+Panel menyediakan contoh konfigurasi untuk OpenClaw, Codex CLI, Claude Code, dan
+Hermes Agent. Semua client memakai endpoint Streamable HTTP `/mcp` dan header
+`Authorization: Bearer ...`. Tombol **Cabut akses** menonaktifkan token segera;
+**Hapus** menghapus record token dan langsung mencabut aksesnya. Nama yang dihapus
+dapat digunakan kembali untuk membuat token baru dari panel. Token default
+`MCP_TOKEN_NAME` ditandai `deleted` sebagai tombstone agar daemon restart tidak
+menghidupkan kembali token file lama; token non-default benar-benar dihapus.
+
+Endpoint dashboard yang dipakai panel adalah `GET /api/mcp/tokens`, `POST
+/api/mcp/tokens` dengan body `{ "name": "codex-laptop" }`, `POST
+/api/mcp/tokens/<name>/revoke`, `DELETE /api/mcp/tokens/<name>`, dan `POST
+/api/mcp/test` untuk memeriksa listener MCP tanpa mengembalikan token. Semua endpoint
+memerlukan session superadmin yang sudah mengganti password bootstrap dan menolak
+request lintas origin.
 
 ## Validasi source
 
