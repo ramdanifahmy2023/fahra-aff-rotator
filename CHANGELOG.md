@@ -2,6 +2,14 @@
 
 ## 2026-09-27
 
+### Added
+
+- Menambahkan MCP Streamable HTTP terpisah pada port 8790 untuk OpenClaw dan agent
+  lain, dengan token Bearer runtime, scope queue/read/health, rate limit, audit
+  metadata, idempotency key, dan tool bounded wait.
+- Menjalankan MCP bersama worker melalui LaunchAgent dan mengikat endpoint remote
+  ke alamat Tailscale privat; cookie Shopee dan endpoint bridge tetap internal.
+
 ### Fixed
 
 - Menambahkan ikon extension Fahra Affiliate Bridge dengan simbol chain-link

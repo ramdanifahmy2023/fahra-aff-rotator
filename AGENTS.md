@@ -108,8 +108,9 @@ sebagai persistence sampai row database berubah.
 - Bridge bergantung pada content script yang termuat di tab Custom Link. Setelah
   update extension, reload extension dan tab Shopee adalah bagian dari deployment.
 - Mode `SHOPEE_TRANSPORT=http` hanya untuk diagnosis dan bisa terkena anti-bot.
-- Mode multi-device atau public deployment belum menjadi bagian dari runtime aman;
-  jangan mengekspos port lokal tanpa desain autentikasi dan TLS.
+- MCP multi-device tersedia pada port terpisah 8790 melalui token Bearer dan
+  allowlist Tailscale. Public deployment tetap belum aman tanpa HTTPS reverse
+  proxy, ACL, rotasi token, dan observability yang sesuai.
 
 ## Auth dan UI yang sudah diterapkan
 

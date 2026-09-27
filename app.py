@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import ipaddress
 import os
 import re
 import secrets
@@ -44,6 +45,22 @@ SHOPEE_ORIGIN = os.getenv("SHOPEE_ORIGIN", "https://affiliate.shopee.co.id")
 SHOPEE_GRAPHQL = SHOPEE_ORIGIN + "/api/v3/gql?q=batchCustomLink"
 SHOPEE_PROFILE = SHOPEE_ORIGIN + "/api/v3/user/profile"
 PORT = int(os.getenv("PORT", "8788"))
+MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.getenv("MCP_PORT", "8790"))
+MCP_ALLOWED_NETWORKS = tuple(
+    ipaddress.ip_network(item.strip(), strict=False)
+    for item in os.getenv("MCP_ALLOWED_NETWORKS", "127.0.0.1/32,100.64.0.0/10,::1/128").split(",")
+    if item.strip()
+)
+MCP_TOKEN_FILE = Path(
+    os.getenv(
+        "MCP_TOKEN_FILE",
+        str(DB_PATH.parent / "mcp-openclaw.token"),
+    )
+)
+MCP_TOKEN_NAME = os.getenv("MCP_TOKEN_NAME", "openclaw")[:80] or "openclaw"
+MCP_MAX_WAIT_SECONDS = max(1, min(300, int(os.getenv("MCP_MAX_WAIT_SECONDS", "180"))))
+MCP_RATE_LIMIT_PER_MINUTE = max(1, int(os.getenv("MCP_RATE_LIMIT_PER_MINUTE", "30")))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "0.8"))
 USER_AGENT = os.getenv(
@@ -105,6 +122,26 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_token_hash ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS mcp_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_name TEXT NOT NULL,
+  method TEXT NOT NULL,
+  request_id TEXT,
+  job_id TEXT,
+  outcome TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mcp_audit_created_at ON mcp_audit(created_at);
+CREATE INDEX IF NOT EXISTS mcp_audit_job_id ON mcp_audit(job_id);
 """
 
 
@@ -132,11 +169,18 @@ def db():
 def init_db() -> None:
     with db() as conn:
         conn.executescript(SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "idempotency_key" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency_key ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
         # A daemon restart must not leave a lease permanently stuck in running.
         conn.execute(
             "UPDATE jobs SET status='queued', updated_at=? WHERE status='running'",
             (now(),),
         )
+    ensure_mcp_token()
 
 
 def now() -> str:
@@ -186,6 +230,114 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def ensure_mcp_token() -> None:
+    """Create one local OpenClaw token on first run and store only its hash in SQLite."""
+    MCP_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        MCP_TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
+    token = ""
+    if MCP_TOKEN_FILE.exists():
+        token = MCP_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    if not token:
+        token = secrets.token_urlsafe(48)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(MCP_TOKEN_FILE, flags, 0o600)
+        except FileExistsError:
+            token = MCP_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(token + "\n")
+    if len(token) < 32:
+        raise RuntimeError(f"MCP token file tidak valid: {MCP_TOKEN_FILE}")
+    hashed = token_hash(token)
+    scopes = json.dumps(["jobs:create", "jobs:read", "health:read"])
+    with db() as conn:
+        existing = conn.execute("SELECT id, token_hash FROM mcp_tokens WHERE name=?", (MCP_TOKEN_NAME,)).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO mcp_tokens(name, token_hash, scopes_json, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (MCP_TOKEN_NAME, hashed, scopes, now()),
+            )
+        elif existing["token_hash"] != hashed:
+            conn.execute(
+                """UPDATE mcp_tokens
+                   SET token_hash=?, scopes_json=?, revoked_at=NULL
+                   WHERE id=?""",
+                (hashed, scopes, existing["id"]),
+            )
+
+
+def create_mcp_token(name: str) -> None:
+    clean_name = str(name or "").strip()[:80]
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", clean_name):
+        raise ValueError("Nama token hanya boleh berisi huruf, angka, titik, garis bawah, atau tanda minus")
+    token = secrets.token_urlsafe(48)
+    with db() as conn:
+        try:
+            conn.execute(
+                """INSERT INTO mcp_tokens(name, token_hash, scopes_json, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (clean_name, token_hash(token), json.dumps(["jobs:create", "jobs:read", "health:read"]), now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RuntimeError(f"Token MCP sudah ada: {clean_name}") from exc
+    print(token)
+
+
+def revoke_mcp_token(name: str) -> None:
+    clean_name = str(name or "").strip()[:80]
+    with db() as conn:
+        result = conn.execute("UPDATE mcp_tokens SET revoked_at=? WHERE name=? AND revoked_at IS NULL", (now(), clean_name))
+        if result.rowcount == 0:
+            raise RuntimeError(f"Token MCP tidak ditemukan atau sudah dicabut: {clean_name}")
+    print(f"Token MCP dicabut: {clean_name}")
+
+
+def mcp_token_from_request(handler: BaseHTTPRequestHandler) -> sqlite3.Row | None:
+    authorization = handler.headers.get("Authorization", "")
+    scheme, _, value = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    hashed = token_hash(value.strip())
+    with db() as conn:
+        row = conn.execute(
+            """SELECT id, name, token_hash, scopes_json
+               FROM mcp_tokens
+               WHERE token_hash=? AND revoked_at IS NULL""",
+            (hashed,),
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE mcp_tokens SET last_used_at=? WHERE id=?", (now(), row["id"]))
+    return row
+
+
+MCP_RATE_LOCK = threading.Lock()
+MCP_RATE_STATE: dict[int, list[float]] = {}
+
+
+def mcp_rate_limited(token_id: int) -> bool:
+    current = time.time()
+    with MCP_RATE_LOCK:
+        recent = [stamp for stamp in MCP_RATE_STATE.get(token_id, []) if current - stamp < 60]
+        limited = len(recent) >= MCP_RATE_LIMIT_PER_MINUTE
+        recent.append(current)
+        MCP_RATE_STATE[token_id] = recent[-(MCP_RATE_LIMIT_PER_MINUTE + 2):]
+        return limited
+
+
+def mcp_audit(token: sqlite3.Row, method: str, request_id: Any, job_id: str | None, outcome: str) -> None:
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO mcp_audit(token_name, method, request_id, job_id, outcome, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (token["name"], method[:100], str(request_id)[:100] if request_id is not None else None, job_id, outcome[:100], now()),
+        )
 
 
 def bootstrap_admin() -> None:
@@ -510,6 +662,57 @@ def job_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def enqueue_job(body: Any, *, idempotency_key: str | None = None) -> tuple[dict[str, Any], bool]:
+    links, tags = validate_job(body)
+    clean_key = (idempotency_key or "").strip()[:200] or None
+    with db() as conn:
+        if clean_key:
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key=?",
+                (clean_key,),
+            ).fetchone()
+            if existing:
+                return job_dict(existing), True
+        job_id = uuid.uuid4().hex
+        conn.execute(
+            "INSERT INTO jobs(id,status,links_json,tags_json,idempotency_key) VALUES(?,?,?,?,?)",
+            (job_id, "queued", json.dumps(links), json.dumps(tags), clean_key),
+        )
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    WORKER.wake()
+    return job_dict(row), False
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return job_dict(row) if row else None
+
+
+def health_summary() -> dict[str, Any]:
+    with BRIDGE_CONDITION:
+        last_seen = float(BRIDGE_LAST_SEEN.get("timestamp", 0))
+        connected = bridge_is_connected()
+        bridge = {
+            "connected": connected,
+            "ready": connected,
+            "last_seen": last_seen or None,
+            "busy": BRIDGE_CURRENT is not None,
+        }
+    return {"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge}
+
+
+def wait_for_job(job_id: str, timeout_seconds: int) -> dict[str, Any] | None:
+    deadline = time.monotonic() + max(1, min(MCP_MAX_WAIT_SECONDS, timeout_seconds))
+    while True:
+        job = get_job(job_id)
+        if job is None or job["status"] in {"completed", "failed", "needs_session"}:
+            return job
+        if time.monotonic() >= deadline:
+            return job
+        time.sleep(0.5)
+
+
 class Worker(threading.Thread):
     daemon = True
 
@@ -639,6 +842,243 @@ def bridge_result(body: Any) -> dict[str, Any]:
     return {"ok": True}
 
 
+MCP_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+MCP_TOOLS = [
+    {
+        "name": "shopee_generate_short_links",
+        "description": "Masukkan 1 sampai 5 URL Shopee ke antrean custom link. Proses dilakukan oleh worker dan tab Shopee yang sudah login.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "links": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
+                "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                "idempotency_key": {"type": "string", "maxLength": 200},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300},
+            },
+            "required": ["links"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "shopee_get_job",
+        "description": "Baca status dan hasil satu job custom link Shopee.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "string", "minLength": 8, "maxLength": 80}},
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "shopee_wait_for_job",
+        "description": "Tunggu job sampai selesai atau batas waktu tercapai. Sukses hanya jika status completed dan shortLink tersedia.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "minLength": 8, "maxLength": 80},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+            },
+            "required": ["job_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "shopee_health",
+        "description": "Periksa status worker dan koneksi extension bridge tanpa membocorkan secret atau path lokal.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "shopee_list_recent_jobs",
+        "description": "Tampilkan job terbaru dengan batas jumlah hasil.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def mcp_text_result(value: Any, *, is_error: bool = False) -> dict[str, Any]:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "content": [{"type": "text", "text": encoded}],
+        "structuredContent": value if isinstance(value, dict) else {"value": value},
+        "isError": is_error,
+    }
+
+
+def mcp_jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def mcp_call_tool(name: str, arguments: Any) -> tuple[dict[str, Any], str | None]:
+    if not isinstance(arguments, dict):
+        raise ValueError("arguments harus berupa object JSON")
+    if name == "shopee_health":
+        return health_summary(), None
+    if name == "shopee_generate_short_links":
+        body = {"links": arguments.get("links"), "tags": arguments.get("tags", [])}
+        idem = str(arguments.get("idempotency_key", "")).strip()[:200] or None
+        job, reused = enqueue_job(body, idempotency_key=idem)
+        wait_seconds = int(arguments.get("wait_seconds", 0) or 0)
+        if wait_seconds:
+            job = wait_for_job(job["id"], wait_seconds) or job
+        return {
+            "job_id": job["id"],
+            "status": job["status"],
+            "reused": reused,
+            "accepted_count": len(job["links"]),
+            "job": job,
+        }, job["id"]
+    if name == "shopee_get_job":
+        job_id = str(arguments.get("job_id", "")).strip()
+        if not job_id:
+            raise ValueError("job_id wajib diisi")
+        job = get_job(job_id)
+        if job is None:
+            raise LookupError("Job tidak ditemukan")
+        return job, job_id
+    if name == "shopee_wait_for_job":
+        job_id = str(arguments.get("job_id", "")).strip()
+        if not job_id:
+            raise ValueError("job_id wajib diisi")
+        timeout = int(arguments.get("timeout_seconds", MCP_MAX_WAIT_SECONDS) or MCP_MAX_WAIT_SECONDS)
+        job = wait_for_job(job_id, timeout)
+        if job is None:
+            raise LookupError("Job tidak ditemukan")
+        return job, job_id
+    if name == "shopee_list_recent_jobs":
+        limit = max(1, min(50, int(arguments.get("limit", 20) or 20)))
+        with db() as conn:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return {"jobs": [job_dict(row) for row in rows]}, None
+    raise LookupError(f"Tool tidak tersedia: {name}")
+
+
+class MCPHandler(BaseHTTPRequestHandler):
+    server_version = "FahraAffiliateRotatorMCP/0.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"[mcp {time.strftime('%H:%M:%S')}] {fmt % args}")
+
+    def send_mcp(self, value: Any, status: int = HTTPStatus.OK) -> None:
+        raw = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def authenticate(self) -> sqlite3.Row | None:
+        try:
+            client_ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            client_ip = None
+        if client_ip is None or not any(client_ip in network for network in MCP_ALLOWED_NETWORKS):
+            self.send_mcp({"error": "Alamat jaringan tidak diizinkan"}, HTTPStatus.FORBIDDEN)
+            return None
+        token = mcp_token_from_request(self)
+        if not token:
+            self.send_response(HTTPStatus.UNAUTHORIZED)
+            self.send_header("WWW-Authenticate", 'Bearer realm="fahra-affiliate-mcp"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
+        if mcp_rate_limited(int(token["id"])):
+            self.send_mcp({"error": "Terlalu banyak request MCP. Coba lagi sebentar."}, HTTPStatus.TOO_MANY_REQUESTS)
+            return None
+        return token
+
+    def do_GET(self) -> None:
+        if self.path != "/mcp":
+            self.send_mcp({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        if not self.authenticate():
+            return
+        self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+        self.send_header("Allow", "POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "POST, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        if self.path != "/mcp":
+            self.send_mcp({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+            return
+        token = self.authenticate()
+        if not token:
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 1_000_000:
+                raise ValueError("Request MCP terlalu besar")
+            request = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+                self.send_mcp(mcp_jsonrpc_error(None, -32600, "Invalid JSON-RPC request"), HTTPStatus.BAD_REQUEST)
+                return
+            request_id = request.get("id")
+            method = str(request.get("method", ""))
+            params = request.get("params") or {}
+            if method == "notifications/initialized":
+                self.send_response(HTTPStatus.ACCEPTED)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if method.startswith("notifications/"):
+                self.send_response(HTTPStatus.ACCEPTED)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if method == "initialize":
+                requested = str(params.get("protocolVersion", ""))
+                version = requested if requested in MCP_PROTOCOL_VERSIONS else "2025-03-26"
+                result = {
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "fahra-affiliate-rotator", "version": "0.1.0"},
+                }
+                mcp_audit(token, method, request_id, None, "ok")
+                self.send_mcp({"jsonrpc": "2.0", "id": request_id, "result": result})
+                return
+            if method == "ping":
+                mcp_audit(token, method, request_id, None, "ok")
+                self.send_mcp({"jsonrpc": "2.0", "id": request_id, "result": {}})
+                return
+            if method == "tools/list":
+                if "tools:read" not in json.loads(token["scopes_json"]) and "jobs:read" not in json.loads(token["scopes_json"]):
+                    self.send_mcp(mcp_jsonrpc_error(request_id, -32003, "Scope tidak mencukupi"), HTTPStatus.FORBIDDEN)
+                    return
+                mcp_audit(token, method, request_id, None, "ok")
+                self.send_mcp({"jsonrpc": "2.0", "id": request_id, "result": {"tools": MCP_TOOLS}})
+                return
+            if method == "tools/call":
+                name = str(params.get("name", ""))
+                scope = "health:read" if name == "shopee_health" else ("jobs:create" if name == "shopee_generate_short_links" else "jobs:read")
+                scopes = set(json.loads(token["scopes_json"]))
+                if scope not in scopes:
+                    self.send_mcp(mcp_jsonrpc_error(request_id, -32003, "Scope tidak mencukupi"), HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    result, job_id = mcp_call_tool(name, params.get("arguments") or {})
+                    mcp_audit(token, method, request_id, job_id, "ok")
+                    self.send_mcp({"jsonrpc": "2.0", "id": request_id, "result": mcp_text_result(result)})
+                except (ValueError, LookupError, RuntimeError) as exc:
+                    message = str(exc)[:500]
+                    mcp_audit(token, method, request_id, None, "error")
+                    self.send_mcp({"jsonrpc": "2.0", "id": request_id, "result": mcp_text_result({"error": message}, is_error=True)})
+                return
+            self.send_mcp(mcp_jsonrpc_error(request_id, -32601, f"Method tidak tersedia: {method}"), HTTPStatus.NOT_FOUND)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_mcp(mcp_jsonrpc_error(None, -32700, str(exc)), HTTPStatus.BAD_REQUEST)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "FahraAffiliateRotator/0.1"
 
@@ -706,16 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"user": {"email": user["email"], "role": user["role"], "must_change_password": bool(user["must_change_password"])}})
             return
         if parsed.path == "/api/health":
-            with BRIDGE_CONDITION:
-                last_seen = float(BRIDGE_LAST_SEEN.get("timestamp", 0))
-                connected = bridge_is_connected()
-                bridge = {
-                    "connected": connected,
-                    "ready": connected,
-                    "last_seen": last_seen or None,
-                    "busy": BRIDGE_CURRENT is not None,
-                }
-            self.send_json({"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge})
+            self.send_json(health_summary())
             return
         if parsed.path == "/api/bridge/next":
             if not self.require_user():
@@ -838,15 +1269,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Ganti password terlebih dahulu"}, HTTPStatus.FORBIDDEN)
             return
         try:
-            links, tags = validate_job(self.read_json())
-            job_id = uuid.uuid4().hex
-            with db() as conn:
-                conn.execute(
-                    "INSERT INTO jobs(id,status,links_json,tags_json) VALUES(?,?,?,?)",
-                    (job_id, "queued", json.dumps(links), json.dumps(tags)),
-                )
-            WORKER.wake()
-            self.send_json({"id": job_id, "status": "queued"}, HTTPStatus.ACCEPTED)
+            job, reused = enqueue_job(self.read_json())
+            self.send_json({"id": job["id"], "status": job["status"], "reused": reused}, HTTPStatus.ACCEPTED)
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -1174,9 +1598,25 @@ def main() -> None:
     if "--bootstrap-admin" in os.sys.argv:
         bootstrap_admin()
         return
-    WORKER.start()
+    if "--create-mcp-token" in os.sys.argv:
+        index = os.sys.argv.index("--create-mcp-token")
+        if index + 1 >= len(os.sys.argv):
+            raise SystemExit("Gunakan: app.py --create-mcp-token NAMA_AGENT")
+        create_mcp_token(os.sys.argv[index + 1])
+        return
+    if "--revoke-mcp-token" in os.sys.argv:
+        index = os.sys.argv.index("--revoke-mcp-token")
+        if index + 1 >= len(os.sys.argv):
+            raise SystemExit("Gunakan: app.py --revoke-mcp-token NAMA_AGENT")
+        revoke_mcp_token(os.sys.argv[index + 1])
+        return
     server = ThreadingHTTPServer((os.getenv("HOST", "127.0.0.1"), PORT), Handler)
+    mcp_server = ThreadingHTTPServer((MCP_HOST, MCP_PORT), MCPHandler)
+    WORKER.start()
+    mcp_thread = threading.Thread(target=mcp_server.serve_forever, name="affiliate-mcp", daemon=True)
+    mcp_thread.start()
     print(f"Fahra Affiliate Rotator berjalan di http://{server.server_address[0]}:{PORT}")
+    print(f"MCP OpenClaw berjalan di http://{mcp_server.server_address[0]}:{MCP_PORT}/mcp")
     print(f"Cookie: {COOKIE_FILE}")
     print(f"Header rekaman hanya untuk mode HTTP diagnosis: {REQUEST_HEADERS_FILE}")
     try:
@@ -1187,6 +1627,8 @@ def main() -> None:
         WORKER.stop_event.set()
         WORKER.wake()
         server.server_close()
+        mcp_server.shutdown()
+        mcp_server.server_close()
 
 
 if __name__ == "__main__":

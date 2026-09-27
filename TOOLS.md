@@ -19,6 +19,8 @@ Fahra Affiliate Rotator.
 | LaunchAgent | `~/Library/LaunchAgents/com.fahra.aff-rotator.plist` |
 | Error log | `/tmp/fahra-aff-rotator.err` |
 | Standard output | `/tmp/fahra-aff-rotator.out` |
+| MCP endpoint | `http://100.99.69.106:8790/mcp` melalui Tailscale |
+| MCP token | `/Users/fahra/fahra-affiliate-data/mcp-openclaw.token` mode 0600 |
 
 ## Menjalankan dan memeriksa service
 
@@ -37,6 +39,7 @@ Periksa process, port, dan health secara terpisah:
 lsof -nP -iTCP:8788 -sTCP:LISTEN
 curl -sS http://127.0.0.1:8788/api/health
 tail -n 100 /tmp/fahra-aff-rotator.err
+lsof -nP -iTCP:8790 -sTCP:LISTEN
 ```
 
 Pada macOS, LaunchAgent biasanya menjaga process tetap hidup:
@@ -64,6 +67,11 @@ direstart. Setelah restart, cek kembali health dan database.
 | `SHOPEE_COOKIE_FILE` | Cookie fallback lokal; jangan commit |
 | `SHOPEE_REQUEST_HEADERS_FILE` | Header hasil capture fallback; jangan commit |
 | `SHOPEE_BROWSER_PROFILE` | Profile fallback browser; jangan commit |
+| `MCP_HOST` / `MCP_PORT` | Bind MCP terpisah dari webapp; LaunchAgent memakai Tailscale IP dan port 8790 |
+| `MCP_ALLOWED_NETWORKS` | Allowlist sumber MCP, default loopback dan Tailscale `100.64.0.0/10` |
+| `MCP_TOKEN_FILE` | File token MCP mode 0600; token plaintext tidak boleh masuk Git atau log |
+| `MCP_MAX_WAIT_SECONDS` | Batas tunggu tool MCP, maksimum 300 detik |
+| `MCP_RATE_LIMIT_PER_MINUTE` | Batas request per token |
 
 Salin template hanya jika `.env` belum ada:
 
@@ -139,6 +147,39 @@ URL dan tag, menekan `Buat Link`, lalu membaca short link dari modal Shopee.
 
 Endpoint bridge adalah internal untuk extension dan tidak boleh diekspos ke
 internet tanpa autentikasi, origin policy, dan TLS yang dirancang dengan benar.
+
+## MCP OpenClaw
+
+MCP memakai Streamable HTTP pada `/mcp` dengan Bearer token terpisah dari cookie
+webapp. Tool yang diekspos hanya queue dan pembacaan hasil:
+
+- `shopee_generate_short_links`: menerima 1–5 URL dan maksimal 5 tag; mendukung
+  `idempotency_key` dan `wait_seconds`.
+- `shopee_get_job`: membaca satu job.
+- `shopee_wait_for_job`: polling bounded sampai terminal atau timeout.
+- `shopee_health`: status worker dan bridge tanpa path lokal.
+- `shopee_list_recent_jobs`: riwayat terbatas maksimal 50 item.
+
+MCP tidak mengekspos `/api/bridge/next`, `/api/bridge/result`, lease token, cookie,
+request header Shopee, atau database path. Request diaudit sebagai metadata aman.
+Token pertama dibuat otomatis pada `MCP_TOKEN_FILE`; untuk OpenClaw, sediakan
+nilainya melalui environment `FAHRA_AFF_MCP_TOKEN` dan gunakan transport
+`streamable-http` pada URL Tailscale. Jangan menaruh token di repository atau
+pesan log.
+
+Untuk agent tambahan, buat token terpisah dan salin nilai yang dicetak sekali
+melalui kanal rahasia:
+
+```sh
+/opt/homebrew/bin/python3 app.py --create-mcp-token nama-agent
+```
+
+Database hanya menyimpan hash token. Token yang sudah terlanjur terekspos harus
+dicabut sebelum membuat token pengganti:
+
+```sh
+/opt/homebrew/bin/python3 app.py --revoke-mcp-token nama-agent
+```
 
 ## Validasi source
 

@@ -35,6 +35,46 @@ launchctl print gui/$(id -u)/com.fahra.aff-rotator
 curl http://127.0.0.1:8788/api/health
 ```
 
+## MCP untuk OpenClaw dan agent lain
+
+MCP berjalan pada port terpisah `8790` dan tidak memakai session cookie webapp.
+Agent menggunakan token Bearer khusus yang dibuat otomatis sekali pada file
+runtime `mcp-openclaw.token` dengan mode 0600. Cookie Shopee, lease bridge, dan
+header rekaman tidak pernah dikirim ke MCP.
+
+Pada Mac ini LaunchAgent membuka port MCP dengan allowlist loopback dan jaringan
+Tailscale. Perangkat pada tailnet dapat memakai alamat Tailscale Mac ini:
+
+```text
+http://100.99.69.106:8790/mcp
+```
+
+Alamat tersebut hanya boleh diakses melalui jaringan privat Tailscale. Jangan
+membuka port ini ke internet publik tanpa HTTPS reverse proxy, ACL, dan rotasi
+token. Konfigurasi OpenClaw menggunakan transport `streamable-http`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "fahra-aff-rotator": {
+        "url": "http://100.99.69.106:8790/mcp",
+        "transport": "streamable-http",
+        "headers": {
+          "Authorization": "Bearer ${FAHRA_AFF_MCP_TOKEN}"
+        }
+      }
+    }
+  }
+}
+```
+
+Tool yang tersedia: `shopee_generate_short_links`, `shopee_get_job`,
+`shopee_wait_for_job`, `shopee_health`, dan `shopee_list_recent_jobs`. Panggilan
+generate mengembalikan `job_id`; hasil dianggap selesai hanya ketika status
+`completed` dan `result[].shortLink` tersedia. `needs_session` berarti tab
+Custom Link Shopee perlu login atau verifikasi manual.
+
 ## Extension bridge
 
 1. Buka Chrome dengan akun Affiliate Shopee yang sudah login.

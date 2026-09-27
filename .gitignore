@@ -1,6 +1,7 @@
 data/*.sqlite3
 data/*.sqlite3-*
 data/*.log
+data/*.token
 data/shopee-browser-profile/
 Credential/request_headers.json
 Credential/cookies.txt

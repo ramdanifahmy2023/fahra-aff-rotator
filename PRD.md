@@ -142,6 +142,9 @@ Fitur dianggap selesai bila:
 7. Tema terang, gelap, dan sistem dapat dipilih pada login serta dashboard.
 8. Tidak ada credential atau database runtime pada commit Git.
 9. Validasi Python/JavaScript dan `git diff --check` lulus.
+10. MCP OpenClaw dapat melakukan handshake, `tools/list`, dan `shopee_health` dengan
+    token terpisah; generate mengembalikan job durable dan tidak mengekspos cookie
+    atau endpoint bridge.
 
 ## Kondisi saat ini
 
@@ -154,6 +157,8 @@ Yang sudah berjalan:
 - Repository private dengan README dan changelog.
 - Auth superadmin, session SQLite, bootstrap password satu kali, dan proteksi bridge.
 - Halaman login, ganti password awal, tema sistem/terang/gelap, serta responsive UI.
+- MCP Streamable HTTP pada port 8790 dengan token Bearer runtime, audit metadata,
+  idempotency key, bounded wait, dan akses Tailscale terbatas.
 
 Yang masih perlu diperbaiki:
 
@@ -161,8 +166,8 @@ Yang masih perlu diperbaiki:
   beberapa bentuk modal dan navigasi.
 - Pesan `needs_session` perlu membedakan login, CAPTCHA/verifikasi, tab salah, dan
   timeout hasil agar troubleshooting lebih cepat.
-- Akses lintas-device masih memerlukan deployment terpisah dengan TLS dan kontrol
-  jaringan; runtime saat ini tetap bind ke loopback.
+- Akses publik berbasis domain dan TLS reverse proxy belum dipasang; akses saat ini
+  dibatasi ke Tailscale atau loopback melalui allowlist jaringan.
 - Belum ada observability terstruktur untuk latency job tanpa mencatat data sensitif.
 
 ## Roadmap
@@ -181,10 +186,13 @@ Yang masih perlu diperbaiki:
 
 ### Tahap 3 — Akses perangkat lain
 
-- Pisahkan webapp dari worker browser.
-- Tambahkan autentikasi dan TLS.
-- Rancang pairing satu browser worker ke satu akun tanpa mengekspos cookie.
-- Tambahkan audit log yang aman dan batas rate.
+- Sediakan MCP Streamable HTTP pada port terpisah dari webapp.
+- Gunakan Bearer token per agent, scope, idempotency key, audit log aman, dan rate limit.
+- Pertahankan browser worker, cookie, lease, dan bridge sebagai komponen privat.
+- Akses lintas perangkat melalui Tailscale atau HTTPS reverse proxy dengan ACL;
+  jangan membuka port Python mentah ke internet.
+- Jalankan webapp dan MCP melalui LaunchAgent `RunAtLoad` + `KeepAlive` agar pulih
+  setelah macOS restart.
 
 ## Keputusan arsitektur yang tidak boleh dilupakan
 
