@@ -6,6 +6,19 @@ Repository ini sengaja tidak menyimpan `.env`, cookie, header sesi, database run
 profile browser, atau `node_modules`. Siapkan file lokal dari `.env.example` dan isi
 credential hanya pada mesin yang menjalankan worker.
 
+## Clone repository
+
+Repository source tersedia public:
+
+```sh
+git clone https://github.com/ramdanifahmy2023/fahra-aff-rotator.git
+cd fahra-aff-rotator
+```
+
+Perintah clone dapat dipakai di Windows Server dengan Git terpasang. Startup
+`start.sh` dan LaunchAgent di bawah khusus macOS; startup service Windows perlu
+disesuaikan. Clone tidak menyertakan credential, database, atau sesi Chrome.
+
 ## Menjalankan
 
 ```sh

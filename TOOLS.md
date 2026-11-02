@@ -278,4 +278,4 @@ git push origin main
 ```
 
 Gunakan commit kecil yang menjelaskan perubahan perilaku. Repository GitHub
-bersifat private; tetap perlakukan semua data lokal sebagai rahasia.
+bersifat public; hanya source yang boleh dipush. Tetap perlakukan semua data lokal sebagai rahasia.

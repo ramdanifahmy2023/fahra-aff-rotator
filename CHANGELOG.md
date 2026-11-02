@@ -27,6 +27,9 @@
 
 ### Deployment
 
+- Repository GitHub dijadikan public untuk distribusi source dan clone ke Windows
+  Server. Data runtime dan credential tetap lokal; dokumentasi clone ditambahkan.
+
 - Reload extension dan tab Custom Link secara manual pada setiap profil, login
   dashboard lokal, lalu isi nama akun lewat ikon extension. Client MCP perlu
   memuat ulang tools/list dan menyertakan account_id. Nama akun masih label manual;

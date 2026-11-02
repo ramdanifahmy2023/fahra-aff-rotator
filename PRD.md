@@ -161,7 +161,7 @@ Yang sudah berjalan:
 - SQLite durable dengan recovery saat restart.
 - Extension Manifest V3 untuk bridge tab browser.
 - Fallback browser worker dan HTTP diagnosis tetap tersedia.
-- Repository private dengan README dan changelog.
+- Repository public dengan README dan changelog; credential dan data runtime tetap lokal.
 - Auth superadmin, session SQLite, bootstrap password satu kali, dan proteksi bridge.
 - Halaman login, ganti password awal, tema sistem/terang/gelap, serta responsive UI.
 - MCP Streamable HTTP pada port 8790 dengan token Bearer runtime, audit metadata,
