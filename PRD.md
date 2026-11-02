@@ -209,3 +209,13 @@ Extension bridge adalah jalur produksi karena Shopee menjalankan pembuatan link
 di halaman resmi dengan sesi browser yang sudah ada. Cookie file dan captured
 headers adalah fallback/diagnosis lokal, bukan alasan untuk memindahkan credential
 ke server atau frontend.
+
+## Peningkatan bridge multiakun 2026-11-02
+
+Bridge 0.2.0 memiliki ID tetap per profil Chrome, label akun dari pengaturan
+extension, dan routing job berdasarkan account_id yang wajib dipilih dari UI/API/MCP.
+Satu profil dipakai tetap untuk satu akun Shopee dan satu tab Custom Link. Label
+belum diverifikasi terhadap identitas Shopee secara otomatis. Worker masih serial;
+akun offline tidak mengambil job akun lain. Heartbeat, delivery sekali per lease,
+validasi hasil berdasarkan akun, dan riwayat akun menjadi bagian penerimaan.
+Riwayat lama tetap tersedia; antrean lama tanpa akun meminta kirim ulang eksplisit.

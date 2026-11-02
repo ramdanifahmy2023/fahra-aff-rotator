@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-11-02
+
+### Added
+
+- Bridge 0.2.0 dengan ID tetap per profil Chrome, pengaturan nama akun melalui
+  ikon extension, daftar kesiapan akun, dan pilihan akun pada dashboard.
+- Routing job UI/API/MCP melalui account_id wajib; riwayat menyimpan ID dan nama
+  akun saat job dibuat. Menambahkan GET /api/accounts dan shopee_list_accounts.
+- Migrasi SQLite mempertahankan riwayat dan target akun saat restart. Antrean
+  lama tanpa akun menjadi needs_session agar operator memilih akun saat kirim ulang.
+- Tes regresi dengan database sementara untuk simulasi 10 akun, isolasi lease,
+  expiry, restart, migrasi, idempotency, HTTP auth, MCP, dan polling extension.
+
+### Fixed
+
+- Job hanya dikirim sekali per lease ke bridge akun yang sesuai; hasil lintas
+  akun, duplikat, dan lease kedaluwarsa ditolak. Akun offline tidak menghalangi
+  antrean akun yang siap, dengan worker tetap serial.
+- Mengunci polling sejak awal untuk mencegah klaim ganda dan mempertahankan
+  heartbeat saat job berjalan. Tab Custom Link ganda dalam satu profil ditolak.
+- Recovery hasil hanya memakai hasil sukses dengan ID job yang sama, sehingga
+  modal lama tidak dibaca sebagai hasil job baru. Content script lama meminta reload.
+- Completed memerlukan jumlah hasil yang sesuai dan short link Shopee valid.
+  Idempotency key tidak dapat mengembalikan hasil akun atau input berbeda.
+
+### Deployment
+
+- Reload extension dan tab Custom Link secara manual pada setiap profil, login
+  dashboard lokal, lalu isi nama akun lewat ikon extension. Client MCP perlu
+  memuat ulang tools/list dan menyertakan account_id. Nama akun masih label manual;
+  gunakan satu profil tetap per akun Shopee. Eksekusi paralel belum tersedia.
+
 ## 2026-09-27
 
 ### Added

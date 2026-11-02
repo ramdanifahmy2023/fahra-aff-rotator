@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS jobs (
   attempt INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS affiliate_accounts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   email TEXT NOT NULL UNIQUE,
@@ -177,6 +182,16 @@ def init_db() -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN idempotency_key TEXT")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency_key ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        if "account_id" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN account_id TEXT")
+        if "account_name" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN account_name TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS jobs_account_status ON jobs(account_id,status,created_at)")
+        conn.execute(
+            "UPDATE jobs SET status='needs_session', error=?, updated_at=? "
+            "WHERE account_id IS NULL AND status IN ('queued','running')",
+            ("Job lama belum memiliki akun affiliate. Pilih akun lalu kirim ulang job.", now()),
         )
         mcp_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mcp_tokens)").fetchall()}
         if "deleted_at" not in mcp_columns:
@@ -572,11 +587,13 @@ def refresh_csrf(cookie: str, headers: dict[str, str]) -> str | None:
     return None
 
 
-def create_links(links: list[str], tags: list[str], *, job_id: str | None = None) -> list[dict[str, Any]]:
+def create_links(links: list[str], tags: list[str], *, job_id: str | None = None, account_id: str | None = None) -> list[dict[str, Any]]:
     if TRANSPORT == "extension":
         if not job_id:
             raise RuntimeError("Job ID wajib untuk extension bridge")
-        return create_links_via_extension(links, tags, job_id)
+        return create_links_via_extension(links, tags, job_id, account_id)
+    if account_id:
+        raise SessionExpired("Job per akun hanya dapat diproses melalui extension. Aktifkan SHOPEE_TRANSPORT=extension.")
     if TRANSPORT == "browser":
         return create_links_in_browser(links, tags)
     if TRANSPORT != "http":
@@ -619,7 +636,7 @@ def create_links(links: list[str], tags: list[str], *, job_id: str | None = None
     return rows
 
 
-def create_links_via_extension(links: list[str], tags: list[str], job_id: str) -> list[dict[str, Any]]:
+def create_links_via_extension(links: list[str], tags: list[str], job_id: str, account_id: str | None) -> list[dict[str, Any]]:
     global BRIDGE_CURRENT
     event = threading.Event()
     lease_token = secrets.token_urlsafe(24)
@@ -629,6 +646,7 @@ def create_links_via_extension(links: list[str], tags: list[str], job_id: str) -
         BRIDGE_CURRENT = {
             "event": event,
             "job_id": job_id,
+            "account_id": account_id,
             "links": links,
             "tags": tags,
             "lease_token": lease_token,
@@ -651,7 +669,7 @@ def create_links_via_extension(links: list[str], tags: list[str], job_id: str) -
             raise RuntimeError(message)
         results = response.get("results")
         if not isinstance(results, list) or len(results) != len(links):
-            raise RuntimeError("Extension bridge mengembalikan jumlah hasil yang tidak sesuai")
+            raise SessionExpired("Hasil bridge tidak lengkap. Periksa tab akun terpilih lalu kirim ulang bila diperlukan.")
         return results
     finally:
         with BRIDGE_CONDITION:
@@ -737,24 +755,38 @@ def job_dict(row: sqlite3.Row) -> dict[str, Any]:
         "result": json.loads(row["result_json"]) if row["result_json"] else None,
         "error": row["error"],
         "attempt": row["attempt"],
+        "account_id": row["account_id"],
+        "account_name": row["account_name"],
     }
 
 
 def enqueue_job(body: Any, *, idempotency_key: str | None = None) -> tuple[dict[str, Any], bool]:
     links, tags = validate_job(body)
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not re.fullmatch(r"[a-f0-9]{32}", account_id):
+        raise ValueError("Pilih akun affiliate. Atur nama akun pada extension di setiap profil Chrome terlebih dahulu.")
+    if TRANSPORT != "extension":
+        raise ValueError("Job per akun memerlukan SHOPEE_TRANSPORT=extension")
     clean_key = (idempotency_key or "").strip()[:200] or None
     with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        account = conn.execute("SELECT * FROM affiliate_accounts WHERE id=?", (account_id,)).fetchone()
+        if not account:
+            raise ValueError("Akun affiliate tidak terdaftar. Hubungkan extension profil akun tersebut terlebih dahulu.")
         if clean_key:
             existing = conn.execute(
                 "SELECT * FROM jobs WHERE idempotency_key=?",
                 (clean_key,),
             ).fetchone()
             if existing:
+                if (existing["account_id"] != account_id or json.loads(existing["links_json"]) != links
+                        or json.loads(existing["tags_json"]) != tags):
+                    raise ValueError("idempotency_key sudah dipakai untuk akun atau input lain")
                 return job_dict(existing), True
         job_id = uuid.uuid4().hex
         conn.execute(
-            "INSERT INTO jobs(id,status,links_json,tags_json,idempotency_key) VALUES(?,?,?,?,?)",
-            (job_id, "queued", json.dumps(links), json.dumps(tags), clean_key),
+            "INSERT INTO jobs(id,status,links_json,tags_json,idempotency_key,account_id,account_name) VALUES(?,?,?,?,?,?,?)",
+            (job_id, "queued", json.dumps(links), json.dumps(tags), clean_key, account_id, account["name"]),
         )
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     WORKER.wake()
@@ -769,13 +801,15 @@ def get_job(job_id: str) -> dict[str, Any] | None:
 
 def health_summary() -> dict[str, Any]:
     with BRIDGE_CONDITION:
-        last_seen = float(BRIDGE_LAST_SEEN.get("timestamp", 0))
+        last_seen = max((float(state["timestamp"]) for state in BRIDGE_STATES.values()), default=0)
         connected = bridge_is_connected()
         bridge = {
             "connected": connected,
             "ready": connected,
             "last_seen": last_seen or None,
             "busy": BRIDGE_CURRENT is not None,
+            "ready_accounts": len(ready_account_ids()),
+            "protocol_version": 2,
         }
     return {"status": "ok", "worker": WORKER.is_alive(), "bridge": bridge}
 
@@ -856,12 +890,19 @@ class Worker(threading.Thread):
                 print(f"[worker] gagal menyimpan status job: {exc}", flush=True)
 
     def claim(self) -> sqlite3.Row | None:
-        if TRANSPORT == "extension" and not bridge_is_connected():
+        accounts = ready_account_ids()
+        if TRANSPORT == "extension" and not accounts:
             return None
         with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
-            ).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            if TRANSPORT == "extension":
+                placeholders = ",".join("?" for _ in accounts)
+                row = conn.execute(
+                    f"SELECT * FROM jobs WHERE status='queued' AND account_id IN ({placeholders}) "
+                    "ORDER BY created_at,id LIMIT 1", accounts,
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1").fetchone()
             if row is None:
                 return None
             conn.execute(
@@ -876,9 +917,15 @@ class Worker(threading.Thread):
                 json.loads(row["links_json"]),
                 json.loads(row["tags_json"]),
                 job_id=row["id"],
+                account_id=row["account_id"],
             )
-            status = "completed" if all(item.get("failCode", 0) == 0 for item in result) else "failed"
-            error = None if status == "completed" else "Shopee mengembalikan failCode pada salah satu link"
+            valid = (len(result) == len(json.loads(row["links_json"])) and all(
+                isinstance(item, dict) and item.get("failCode", 0) == 0
+                and re.fullmatch(r"https://s\.shopee\.co\.id/[A-Za-z0-9]+", str(item.get("shortLink", "")))
+                for item in result
+            ))
+            status = "completed" if valid else "failed"
+            error = None if status == "completed" else "Hasil Shopee tidak lengkap atau salah satu link gagal. Periksa tab akun tersebut lalu kirim ulang."
             self.finish(row["id"], status, result, error)
         except SessionExpired as exc:
             self.finish(row["id"], "needs_session", None, str(exc))
@@ -902,49 +949,83 @@ WORKER = Worker()
 
 BRIDGE_CONDITION = threading.Condition()
 BRIDGE_CURRENT: dict[str, Any] | None = None
-BRIDGE_LAST_SEEN: dict[str, Any] = {}
+BRIDGE_STATES: dict[str, dict[str, Any]] = {}
+
+
+def bridge_identity(body: Any) -> str:
+    if not isinstance(body, dict) or body.get("protocol_version") != 2:
+        raise ValueError("Bridge versi lama. Reload extension dan tab Custom Link, lalu atur nama akun pada extension.")
+    account_id = body.get("account_id")
+    if not isinstance(account_id, str) or not re.fullmatch(r"[a-f0-9]{32}", account_id):
+        raise ValueError("ID akun bridge tidak valid. Buka pengaturan extension pada profil ini.")
+    return account_id
+
+
+def ready_account_ids() -> list[str]:
+    with BRIDGE_CONDITION:
+        return [key for key, state in BRIDGE_STATES.items()
+                if state.get("ready") and time.monotonic() - state["seen"] < 10]
 
 
 def bridge_is_connected() -> bool:
+    return bool(ready_account_ids())
+
+
+def list_affiliate_accounts() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM affiliate_accounts ORDER BY name,id").fetchall()
     with BRIDGE_CONDITION:
-        seen = float(BRIDGE_LAST_SEEN.get("timestamp", 0))
-        return bool(BRIDGE_LAST_SEEN.get("ready")) and time.time() - seen < 10
+        ready = set(ready_account_ids())
+        return [{"id": row["id"], "name": row["name"], "ready": row["id"] in ready,
+                 "busy": bool(BRIDGE_CURRENT and BRIDGE_CURRENT["account_id"] == row["id"]),
+                 "last_seen": BRIDGE_STATES.get(row["id"], {}).get("timestamp")}
+                for row in rows]
 
 
 def bridge_ping(body: Any) -> dict[str, Any]:
-    ready = bool(isinstance(body, dict) and body.get("ready"))
-    url = str(body.get("url", ""))[:500] if isinstance(body, dict) else ""
+    account_id = bridge_identity(body)
+    name = body.get("account_name")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+        raise ValueError("Nama akun wajib diisi, maksimal 80 karakter pada pengaturan extension.")
+    url = body.get("url")
+    ready = body.get("ready") is True and url == "https://affiliate.shopee.co.id/offer/custom_link"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO affiliate_accounts(id,name,created_at) VALUES(?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET name=excluded.name WHERE name<>excluded.name",
+            (account_id, name.strip(), now()),
+        )
     with BRIDGE_CONDITION:
-        BRIDGE_LAST_SEEN.update({"timestamp": time.time(), "ready": ready, "url": url})
+        BRIDGE_STATES[account_id] = {"timestamp": time.time(), "seen": time.monotonic(), "ready": ready}
     WORKER.wake()
-    return {"ok": True, "ready": ready}
+    return {"ok": True, "ready": ready, "account_id": account_id}
 
 
-def bridge_next() -> dict[str, Any]:
+def bridge_next(body: Any) -> dict[str, Any]:
+    account_id = bridge_identity(body)
     with BRIDGE_CONDITION:
         current = BRIDGE_CURRENT
-        if not current or current["event"].is_set():
+        if (account_id not in ready_account_ids() or not current or current["event"].is_set()
+                or current["account_id"] != account_id or current["delivered"]):
             return {"job": None}
         current["delivered"] = True
         return {
-            "job": {
-                "id": current["job_id"],
-                "links": current["links"],
-                "tags": current["tags"],
-            },
+            "job": {"id": current["job_id"], "account_id": account_id,
+                    "links": current["links"], "tags": current["tags"]},
             "lease_token": current["lease_token"],
         }
 
 
 def bridge_result(body: Any) -> dict[str, Any]:
-    if not isinstance(body, dict):
-        raise ValueError("Body bridge harus berupa object JSON")
+    account_id = bridge_identity(body)
     job_id = str(body.get("job_id", ""))
     lease_token = str(body.get("lease_token", ""))
     with BRIDGE_CONDITION:
         current = BRIDGE_CURRENT
-        if not current or current["job_id"] != job_id or current["lease_token"] != lease_token:
-            raise ValueError("Lease bridge tidak valid atau sudah kedaluwarsa")
+        if (not current or current["job_id"] != job_id or not current["delivered"]
+                or current["account_id"] != account_id or current["event"].is_set()
+                or not secrets.compare_digest(current["lease_token"].encode(), lease_token.encode())):
+            raise ValueError("Lease bridge tidak valid, akun tidak cocok, atau hasil sudah diterima")
         current["response"] = {
             "results": body.get("results"),
             "error": str(body.get("error", ""))[:500],
@@ -957,18 +1038,21 @@ def bridge_result(body: Any) -> dict[str, Any]:
 
 MCP_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 MCP_TOOLS = [
+    {"name": "shopee_list_accounts", "description": "Daftar akun affiliate dan kesiapan bridge. Pilih id untuk account_id saat generate.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {
         "name": "shopee_generate_short_links",
         "description": "Masukkan 1 sampai 5 URL Shopee ke antrean custom link. Proses dilakukan oleh worker dan tab Shopee yang sudah login.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "account_id": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
                 "links": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
                 "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
                 "idempotency_key": {"type": "string", "maxLength": 200},
                 "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 300},
             },
-            "required": ["links"],
+            "required": ["links", "account_id"],
             "additionalProperties": False,
         },
     },
@@ -1028,10 +1112,12 @@ def mcp_jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any
 def mcp_call_tool(name: str, arguments: Any) -> tuple[dict[str, Any], str | None]:
     if not isinstance(arguments, dict):
         raise ValueError("arguments harus berupa object JSON")
+    if name == "shopee_list_accounts":
+        return {"accounts": list_affiliate_accounts()}, None
     if name == "shopee_health":
         return health_summary(), None
     if name == "shopee_generate_short_links":
-        body = {"links": arguments.get("links"), "tags": arguments.get("tags", [])}
+        body = {"links": arguments.get("links"), "tags": arguments.get("tags", []), "account_id": arguments.get("account_id")}
         idem = str(arguments.get("idempotency_key", "")).strip()[:200] or None
         job, reused = enqueue_job(body, idempotency_key=idem)
         wait_seconds = int(arguments.get("wait_seconds", 0) or 0)
@@ -1296,7 +1382,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/bridge/next":
             if not self.require_user():
                 return
-            self.send_json(bridge_next())
+            self.send_json({"error": "Bridge versi lama. Reload extension dan tab Shopee."}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/accounts":
+            if not self.require_user():
+                return
+            self.send_json({"accounts": list_affiliate_accounts()})
             return
         if parsed.path == "/api/jobs":
             if not self.require_user():
@@ -1422,6 +1513,14 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, RuntimeError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        if parsed.path == "/api/bridge/next":
+            if not self.require_user():
+                return
+            try:
+                self.send_json(bridge_next(self.read_json()))
+            except (ValueError, json.JSONDecodeError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/bridge/ping":
             if not self.require_user():
                 return
@@ -1449,7 +1548,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             job, reused = enqueue_job(self.read_json())
-            self.send_json({"id": job["id"], "status": job["status"], "reused": reused}, HTTPStatus.ACCEPTED)
+            self.send_json({"id": job["id"], "status": job["status"], "account_id": job["account_id"], "reused": reused}, HTTPStatus.ACCEPTED)
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -1587,7 +1686,10 @@ INDEX_HTML = r'''<!doctype html>
     section { min-width:0; background:var(--paper); border:0; border-radius:18px; padding:24px; color:var(--ink); box-shadow:0 18px 40px rgba(0,0,0,.18); }
     h2 { font:700 1.15rem/1.2 var(--sans); margin:0 0 15px; }
     label { display:block; font-weight:650; margin:15px 0 6px; }
-    textarea,input { width:100%; min-height:44px; border:1px solid #cfc7bd; border-radius:8px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; }
+    textarea,input,#affiliate-account { width:100%; min-height:44px; border:1px solid #cfc7bd; border-radius:8px; background:#fff; color:var(--ink); padding:11px 12px; font:inherit; }
+    #affiliate-account { border-color:#887564; color-scheme:light; }
+    #affiliate-account:focus-visible { outline-color:#a94013; }
+    #affiliate-account-hint { color:#66594d; }
     textarea { min-height:160px; resize:vertical; }
     input:focus,textarea:focus,button:focus-visible,select:focus-visible { outline:3px solid var(--focus); outline-offset:2px; }
     .tags { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
@@ -1603,7 +1705,7 @@ INDEX_HTML = r'''<!doctype html>
     .job-head > div { min-width:0; }
     .job-source { display:-webkit-box; min-width:0; overflow:hidden; color:var(--ink); font-weight:700; line-height:1.35; overflow-wrap:anywhere; text-decoration:none; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
     .job-source:hover { color:var(--accent); text-decoration:underline; }
-    .job-id { font-family:var(--mono); font-size:.78rem; color:var(--muted); }
+    .job-id { font-family:var(--mono); font-size:.78rem; color:#66594d; }
     .status { font:500 .72rem/1 var(--mono); text-transform:uppercase; letter-spacing:.04em; }
     .completed { color:#207044; } .failed,.needs_session { color:var(--error); } .queued,.running { color:var(--warn); }
     .result { min-width:0; margin-top:9px; display:grid; gap:6px; }
@@ -1756,6 +1858,9 @@ INDEX_HTML = r'''<!doctype html>
     <div class="dashboard-card">
       <h2 id="create-title">Buat batch link</h2>
       <form id="job-form">
+        <label for="affiliate-account">Buat link dari akun</label>
+        <select id="affiliate-account" name="account_id" required disabled aria-describedby="affiliate-account-hint"><option value="">Memuat akun...</option></select>
+        <p id="affiliate-account-hint" class="hint">Atur nama akun lewat ikon extension pada setiap profil Chrome.</p>
         <label for="links">URL Shopee</label>
         <textarea id="links" name="links" required placeholder="Satu URL per baris" disabled></textarea>
         <p class="hint">URL harus berasal dari shopee.co.id. Maksimal lima baris per job.</p>
@@ -1912,7 +2017,7 @@ function updatePasswordLock() {
   const locked = Boolean(currentUser?.must_change_password);
   $('#password-panel').hidden = false;
   $('#password-hint').textContent = locked ? 'Untuk keamanan, ganti password bootstrap sebelum membuat job.' : 'Masukkan password saat ini dan password baru.';
-  $('#job-form').querySelectorAll('input,textarea,button').forEach(control => { control.disabled = locked; });
+  $('#job-form').querySelectorAll('input,textarea,select,button').forEach(control => { control.disabled = locked; });
   $('#mcp-fieldset').disabled = locked;
   $('#mcp-test').disabled = locked;
   $('#mcp-tokens').querySelectorAll('button').forEach(control => { control.disabled = locked; });
@@ -1963,10 +2068,25 @@ function sourceLabel(value) {
     return value;
   }
 }
+let accountsSignature = '';
+function renderAccounts(accounts) {
+  const signature = JSON.stringify(accounts.map(({id, name, ready}) => ({id, name, ready})));
+  if (accountsSignature === signature) return;
+  accountsSignature = signature;
+  const select = $('#affiliate-account');
+  const chosen = select.value;
+  select.innerHTML = '<option value="">Pilih akun affiliate</option>' + accounts.map(account =>
+    `<option value="${escapeHtml(account.id)}">${escapeHtml(account.name)} (${escapeHtml(account.id.slice(0, 6))}) · ${account.ready ? 'Siap' : 'Tidak terhubung'}</option>`
+  ).join('');
+  select.value = accounts.some(account => account.id === chosen) ? chosen : '';
+  $('#affiliate-account-hint').textContent = accounts.length
+    ? 'Job menunggu profil akun yang dipilih. Biarkan satu tab Custom Link terbuka pada profil itu.'
+    : 'Belum ada akun. Klik ikon extension pada setiap profil Chrome, isi nama akun, lalu login dashboard lokal dan buka tab Custom Link.';
+}
 function renderJob(job) {
   const results = Array.isArray(job.result) ? job.result.map((row, i) => row.shortLink ? `<div class="short-link-row"><span>${i + 1}. </span><a class="copy-link" href="${escapeHtml(row.shortLink)}" data-copy="${escapeHtml(row.shortLink)}" target="_blank" rel="noreferrer" aria-label="Salin short link ${escapeHtml(row.shortLink)}">${escapeHtml(row.shortLink)}</a><button class="copy-link-action" type="button" data-copy="${escapeHtml(row.shortLink)}" aria-label="Salin ${escapeHtml(row.shortLink)}">Salin</button><span class="copy-feedback" role="status" aria-live="polite"></span></div>` : `<div>${i + 1}. Gagal, failCode ${escapeHtml(row.failCode ?? '?')}</div>`).join('') : '';
   const source = String(job.links?.[0] || '');
-  return `<article class="job"><div class="job-head"><div><a class="job-source" href="${escapeHtml(source)}" target="_blank" rel="noreferrer" title="${escapeHtml(source)}" aria-label="Buka URL sumber: ${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</a><div class="job-id">${escapeHtml(job.id)}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
+  return `<article class="job"><div class="job-head"><div><a class="job-source" href="${escapeHtml(source)}" target="_blank" rel="noreferrer" title="${escapeHtml(source)}" aria-label="Buka URL sumber: ${escapeHtml(source)}">${escapeHtml(sourceLabel(source))}</a><div class="job-id">${escapeHtml(job.id)} · ${escapeHtml(job.account_name || 'Akun belum dicatat')}${job.account_id ? ` (${escapeHtml(job.account_id.slice(0, 6))})` : ''}</div></div><span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span></div>${results ? `<div class="result">${results}</div>` : ''}${job.error ? `<p class="error">${escapeHtml(job.error)}</p>` : ''}</article>`;
 }
 function renderPagination() {
   const pagination = $('#jobs-pagination');
@@ -2040,7 +2160,7 @@ function showCopyFeedback(link, message, copied) {
 }
 async function refresh() {
   const me = await api('/api/auth/me');
-  const [health, jobs] = await Promise.all([api('/api/health'), api('/api/jobs')]);
+  const [health, jobs, accounts] = await Promise.all([api('/api/health'), api('/api/jobs'), api('/api/accounts')]);
   currentUser = me.user;
   $('#account-email').textContent = currentUser.email;
   applyTheme(localStorage.getItem('fahra-theme') || 'system');
@@ -2048,6 +2168,7 @@ async function refresh() {
   jobsCache = Array.isArray(jobs.jobs) ? jobs.jobs : [];
   updateHistoryBadge();
   updatePasswordLock();
+  renderAccounts(accounts.accounts || []);
   renderJobs();
   renderRecentJobs();
   try { await loadMcpTokens(); } catch (error) { if (!currentUser?.must_change_password) $('#mcp-message').textContent = error.message; }
@@ -2160,7 +2281,7 @@ $('#recent-jobs').addEventListener('click', handleJobCopy);
 $('#job-form').addEventListener('submit', async (event) => {
   event.preventDefault(); const button = $('#submit'); button.disabled = true; $('#form-message').textContent = 'Menyimpan job...';
   const tags = [1,2,3,4,5].map(i => event.target.elements[`tag${i}`].value.trim());
-  try { const data = await api('/api/jobs', {method:'POST', body:JSON.stringify({links:$('#links').value, tags})}); $('#links').value=''; [1,2,3,4,5].forEach(i => event.target.elements[`tag${i}`].value=''); $('#form-message').textContent = `Job ${data.id} masuk antrean.`; await refresh(); } catch (error) { $('#form-message').textContent = error.message; } finally { button.disabled = false; }
+  try { const data = await api('/api/jobs', {method:'POST', body:JSON.stringify({links:$('#links').value, tags, account_id:$('#affiliate-account').value})}); $('#links').value=''; [1,2,3,4,5].forEach(i => event.target.elements[`tag${i}`].value=''); $('#form-message').textContent = `Job ${data.id} masuk antrean.`; await refresh(); } catch (error) { $('#form-message').textContent = error.message; } finally { button.disabled = false; }
 });
 refresh().catch((error) => { $('#health').textContent = error.message || 'Backend tidak merespons'; });
 setInterval(() => refresh().catch(() => {}), 2500);

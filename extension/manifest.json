@@ -1,9 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Fahra Affiliate Bridge",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Menghubungkan antrean lokal Fahra Affiliate Rotator ke tab Shopee Affiliate yang sudah login.",
-  "permissions": ["tabs", "alarms"],
+  "permissions": [
+    "tabs",
+    "alarms",
+    "storage"
+  ],
   "host_permissions": [
     "https://affiliate.shopee.co.id/*",
     "http://127.0.0.1:8788/*",
@@ -14,8 +18,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://affiliate.shopee.co.id/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://affiliate.shopee.co.id/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -33,5 +41,9 @@
     "32": "icon-32.png",
     "48": "icon-48.png",
     "128": "icon-128.png"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

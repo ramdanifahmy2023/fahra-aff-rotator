@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Akun Fahra Affiliate Bridge</title>
+<link rel="stylesheet" href="options.css">
+</head>
+<body><main>
+<h1>Akun pada profil ini</h1>
+<p>Gunakan satu profil Chrome untuk satu akun Shopee. Nama ini akan muncul pada pilihan akun di dashboard.</p>
+<form id="account-form">
+<label for="account-name">Nama akun affiliate</label>
+<input id="account-name" name="account-name" maxlength="80" required autocomplete="off" aria-describedby="account-help">
+<p id="account-help">Isi nama yang sesuai dengan akun Shopee yang sedang login. Bridge tidak memverifikasi identitas akun Shopee secara otomatis.</p>
+<button type="submit">Simpan nama akun</button>
+</form>
+<p id="message" role="status" aria-live="polite"></p>
+<p id="bridge-status" role="status"></p>
+<p>Buka <a href="http://127.0.0.1:8788/" target="_blank" rel="noreferrer">dashboard lokal</a> dan login pada profil ini. Lalu buka satu tab <a href="https://affiliate.shopee.co.id/offer/custom_link" target="_blank" rel="noreferrer">Custom Link Shopee</a> dan biarkan terbuka.</p>
+<p>Jangan berganti akun Shopee dalam profil yang sama saat ada job. Untuk akun lain, gunakan profil Chrome terpisah dan pasang extension di profil itu.</p>
+</main><script src="options.js"></script></body>
+</html>

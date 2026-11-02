@@ -1,3 +1,7 @@
+let activeJobId = null;
+let jobRunning = false;
+let completedJobResult = null;
+
 function visible(element) {
   const rect = element.getBoundingClientRect();
   const style = getComputedStyle(element);
@@ -25,15 +29,8 @@ function resultModalVisible() {
     .some(element => visible(element) && /Mohon salin link singkat|Link dari Link Khusus/i.test(element.textContent || ''));
 }
 
-function resultsFor(count) {
-  const links = shortLinks();
-  if (!links.length) return null;
-  return {
-    results: links.slice(0, count).map(shortLink => ({ shortLink, longLink: '', failCode: 0 })),
-  };
-}
-
 function ready() {
+  if (location.pathname !== '/offer/custom_link') return false;
   return Boolean(document.querySelector('textarea') && [...document.querySelectorAll('button')].some(button => /Buat Link/i.test(button.textContent || '')));
 }
 
@@ -87,20 +84,27 @@ async function runJob(job) {
     }
     await wait(500);
   }
-  return { error: 'Shopee belum mengembalikan short link dalam 60 detik' };
+  return { error: 'Shopee belum mengembalikan short link dalam 60 detik. Periksa tab akun ini sebelum mengirim ulang.', error_kind: 'needs_session' };
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'ping') {
-    sendResponse({ ready: ready() });
+    sendResponse({ ready: ready(), protocol_version: 2 });
     return false;
   }
   if (message?.type === 'run_job') {
-    runJob(message.job).then(sendResponse).catch(error => sendResponse({ error: String(error?.message || error) }));
+    if (jobRunning || activeJobId === message.job.id) {
+      sendResponse({ error: 'Job sudah diterima tab ini. Periksa hasil sebelum mengirim ulang.', error_kind: 'needs_session' });
+      return false;
+    }
+    activeJobId = message.job.id;
+    completedJobResult = null;
+    jobRunning = true;
+    runJob(message.job).then(result => { completedJobResult = result?.results ? result : null; sendResponse(result); }).catch(error => sendResponse({ error: String(error?.message || error), error_kind: 'needs_session' })).finally(() => { jobRunning = false; });
     return true;
   }
   if (message?.type === 'collect_result') {
-    sendResponse(resultsFor(Number(message.count) || 1));
+    sendResponse(activeJobId === message.job_id && !jobRunning ? completedJobResult : null);
     return false;
   }
   return false;

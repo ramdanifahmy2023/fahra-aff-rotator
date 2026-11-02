@@ -1,50 +1,48 @@
 const APP_URL = 'http://127.0.0.1:8788';
 const POLL_MS = 1500;
 let busy = false;
+let lastError = '';
+
+const identityReady = (async () => {
+  const stored = await chrome.storage.local.get('accountId');
+  if (!stored.accountId) await chrome.storage.local.set({ accountId: crypto.randomUUID().replaceAll('-', '') });
+})();
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function request(path, options = {}) {
+async function request(path, body) {
   const response = await fetch(APP_URL + path, {
-    cache: 'no-store',
-    credentials: 'include',
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    method: 'POST', cache: 'no-store', credentials: 'include',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.error || `Bridge HTTP ${response.status}`);
-  return body;
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `Bridge HTTP ${response.status}`);
+  return data;
 }
 
 async function findReadyTab() {
-  const active = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: ['https://affiliate.shopee.co.id/*'] });
-  const tabs = await chrome.tabs.query({ url: ['https://affiliate.shopee.co.id/*'] });
-  const ordered = [...new Map([...active, ...tabs].map(tab => [tab.id, tab])).values()]
-    .sort((a, b) =>
-      Number(b.url?.includes('/offer/custom_link')) - Number(a.url?.includes('/offer/custom_link')) ||
-      Number(b.active) - Number(a.active) ||
-      Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0));
-  for (const tab of ordered) {
-    try {
-      const state = await chrome.tabs.sendMessage(tab.id, { type: 'ping' });
-      if (state?.ready) return tab;
-    } catch (_) {
-      // The content script is not ready on this tab yet.
-    }
+  const tabs = (await chrome.tabs.query({ url: ['https://affiliate.shopee.co.id/*'] }))
+    .filter(tab => tab.url === 'https://affiliate.shopee.co.id/offer/custom_link');
+  if (tabs.length > 1) throw new Error('Sisakan satu tab Custom Link pada profil ini.');
+  if (!tabs.length) return null;
+  try {
+    const state = await chrome.tabs.sendMessage(tabs[0].id, { type: 'ping' });
+    return state?.ready && state.protocol_version === 2 ? tabs[0] : null;
+  } catch (_) {
+    return null;
   }
-  return null;
 }
 
-async function recoverResult(tabId, count, timeoutMs = 8000) {
+async function recoverResult(tabId, job, timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const result = await chrome.tabs.sendMessage(tabId, { type: 'collect_result', count });
-      if (result?.results?.length >= count) return result;
+      const result = await chrome.tabs.sendMessage(tabId, { type: 'collect_result', job_id: job.id, count: job.links.length });
+      if (result?.results?.length === job.links.length) return result;
     } catch (_) {
-      // The tab may be reloading; retry after the content script is ready.
+      // Only the tab that accepted this job may provide its recovered result.
     }
     await wait(500);
   }
@@ -53,55 +51,63 @@ async function recoverResult(tabId, count, timeoutMs = 8000) {
 
 async function tick() {
   if (busy) return;
-  let tab;
+  busy = true;
+  let heartbeat;
   try {
-    tab = await findReadyTab();
-    await request('/api/bridge/ping', {
-      method: 'POST',
-      body: JSON.stringify({ ready: Boolean(tab), url: tab?.url || '' }),
+    await identityReady;
+    const config = await chrome.storage.local.get(['accountId', 'accountName']);
+    if (!config.accountName) {
+      lastError = 'Klik ikon extension dan isi nama akun untuk profil ini.';
+      return;
+    }
+    const identity = { protocol_version: 2, account_id: config.accountId };
+    let tab = null;
+    let tabError = '';
+    try { tab = await findReadyTab(); } catch (error) { tabError = error.message; }
+    const ping = () => request('/api/bridge/ping', {
+      ...identity, account_name: config.accountName, ready: Boolean(tab), url: tab?.url || '',
     });
+    await ping();
+    lastError = tabError || (tab ? '' : 'Buka satu tab Custom Link, login Shopee, lalu reload tab.');
     if (!tab) return;
-    const next = await request('/api/bridge/next');
+    const next = await request('/api/bridge/next', identity);
     if (!next.job) return;
-    busy = true;
+    if (next.job.account_id !== config.accountId) throw new Error('Akun job tidak cocok dengan profil ini.');
+    heartbeat = setInterval(() => { ping().catch(() => {}); }, 2000);
     let result;
     try {
       result = await chrome.tabs.sendMessage(tab.id, { type: 'run_job', job: next.job });
-    } catch (error) {
-      result = await recoverResult(tab.id, next.job.links.length);
-      if (!result) result = { error: String(error?.message || error), error_kind: 'needs_session' };
+    } catch (_) {
+      result = await recoverResult(tab.id, next.job);
     }
-    if (!result?.results?.length) {
-      const recovered = await recoverResult(tab.id, next.job.links.length);
-      if (recovered) result = recovered;
-    }
+    if (!result?.results?.length && !result?.error) result = await recoverResult(tab.id, next.job);
     await request('/api/bridge/result', {
-      method: 'POST',
-      body: JSON.stringify({
-        job_id: next.job.id,
-        lease_token: next.lease_token,
-        results: result?.results || null,
-        error: result?.error || '',
-        error_kind: result?.error_kind || '',
-      }),
+      ...identity, job_id: next.job.id, lease_token: next.lease_token,
+      results: result?.results || null,
+      error: result?.error || (result?.results ? '' : 'Hasil job tidak dapat dipastikan. Periksa tab akun ini lalu kirim ulang bila diperlukan.'),
+      error_kind: result?.error_kind || (result?.results ? '' : 'needs_session'),
     });
   } catch (error) {
-    // Keep polling. The local webapp may be stopped while Chrome remains open.
+    lastError = error.message || 'Webapp lokal belum dapat dihubungi.';
   } finally {
+    clearInterval(heartbeat);
     busy = false;
   }
 }
 
-function schedule() {
-  tick().finally(() => setTimeout(schedule, POLL_MS));
-}
-
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'bridge_status') return false;
+  sendResponse({ busy, error: lastError });
+  return false;
+});
+chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create('fahra-bridge-wake', { periodInMinutes: 0.5 });
-  schedule();
 });
-chrome.runtime.onStartup.addListener(schedule);
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'fahra-bridge-wake') tick();
 });
+function schedule() {
+  tick().finally(() => setTimeout(schedule, POLL_MS));
+}
 schedule();

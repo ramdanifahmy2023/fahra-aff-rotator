@@ -114,13 +114,13 @@ Membuat job:
 ```sh
 curl -sS -b /tmp/fahra-session -X POST http://127.0.0.1:8788/api/jobs \
   -H 'Content-Type: application/json' \
-  --data '{"links":["https://shopee.co.id/..."],"tags":["konten"]}'
+  --data '{"account_id":"<id dari GET /api/accounts>","links":["https://shopee.co.id/..."],"tags":["konten"]}'
 ```
 
 Response sukses hanya berarti job masuk queue:
 
 ```json
-{"id":"<job-id>","status":"queued"}
+{"id":"<job-id>","status":"queued","account_id":"<id akun>","reused":false}
 ```
 
 Periksa hasil sebenarnya:
@@ -136,25 +136,67 @@ Job selesai harus memiliki `status: "completed"` dan `result[].shortLink`.
 ## Extension bridge
 
 1. Load unpacked folder `extension/` dari `chrome://extensions`.
-2. Buka satu tab `https://affiliate.shopee.co.id/offer/custom_link` yang sudah login.
+2. Gunakan satu profil Chrome per akun. Login dashboard lokal pada setiap profil, klik ikon extension, lalu simpan nama akun yang sesuai dengan login Shopee. Buka satu tab `https://affiliate.shopee.co.id/offer/custom_link` yang sudah login per profil.
 3. Setelah perubahan file extension, tekan **Reload** pada kartu extension.
 4. Reload tab Custom Link agar content script terbaru terpasang.
 5. Pastikan `/api/health` menunjukkan `bridge.connected: true` dan UI menampilkan
    `Bridge aktif`.
 
-Extension background mengambil job dari `/api/bridge/next`, mengoperasikannya pada
+Extension background mengambil job dari `POST /api/bridge/next`, mengoperasikannya pada
 halaman Shopee, lalu mengirim hasil ke `/api/bridge/result`. `content.js` mengisi
 URL dan tag, menekan `Buat Link`, lalu membaca short link dari modal Shopee.
 
 Endpoint bridge adalah internal untuk extension dan tidak boleh diekspos ke
 internet tanpa autentikasi, origin policy, dan TLS yang dirancang dengan benar.
 
+### Routing akun dan payload bridge v2
+
+- `GET /api/accounts` (session superadmin) mengembalikan `accounts`, setiap item
+  memiliki `id` (32 hex), `name`, `ready`, `busy`, dan `last_seen` (Unix timestamp
+  atau null). ID dihasilkan per instalasi profil Chrome dan bukan ID Shopee.
+- `POST /api/jobs` wajib menerima `account_id` yang terdaftar. Response `202`
+  berisi `id`, `status`, `account_id`, `reused`. Detail/list job menyertakan
+  `account_id` dan snapshot `account_name`. Nilainya null pada riwayat lama.
+- Semua POST bridge memerlukan session aplikasi dan body `protocol_version: 2`,
+  `account_id`. Extension lama serta GET next ditolak dengan HTTP 400.
+- Ping: tambahkan `account_name` (1–80 karakter), `ready` (boolean), `url`.
+  Response `{ "ok": true, "ready": true, "account_id": "<32 hex>" }`.
+  URL siap harus persis halaman Custom Link. Lebih dari satu tab Custom Link
+  dalam profil membuat bridge tidak siap. Heartbeat kedaluwarsa setelah 10 detik.
+- Next: response `{ "job": null }` jika akun tidak cocok/tidak siap/tidak ada job;
+  selain itu `{ "job": { "id": "...", "account_id": "...", "links": [],
+  "tags": [] }, "lease_token": "<privat>" }`. Job hanya dikirim sekali per
+  lease, bukan dikirim ulang setiap polling.
+- Result: tambahkan `job_id`, `lease_token`, `results` (array short-link), `error`,
+  `error_kind`. Response `{ "ok": true }`. Hasil akun lain, lease salah,
+  hasil duplikat, atau hasil terlambat ditolak HTTP 400. Lease tidak boleh dicatat.
+- `/api/health` menambahkan `bridge.protocol_version: 2` dan `ready_accounts`
+  sebagai hitungan agregat tanpa mengekspos nama akun atau lease.
+
+Worker masih serial. Job akun offline tetap queued dan tidak menghalangi akun
+lain yang siap. Timeout job yang sudah diambil menjadi `needs_session`.
+Restart mempertahankan target akun. Upgrade mengubah job lama tanpa akun yang
+masih queued/running menjadi needs_session dengan pesan kirim ulang; riwayat
+terminal tidak berubah. Pilih akun secara eksplisit untuk job penggantinya.
+
+ID bridge disimpan di storage lokal extension dan nama akun diisi manual. Bridge
+belum membaca identitas Shopee, jadi gunakan profil tetap per akun. Jangan clone
+folder profil atau mengganti login Shopee ketika ada job. Reset storage extension
+membuat ID baru; tidak ada pemindahan otomatis antrean dari ID lama.
+
+Sesudah deployment 0.2.0, reload extension dan tab Shopee secara manual pada tiap
+profil, isi nama melalui ikon extension, lalu cek daftar akun dashboard. Client
+MCP harus memperbarui cache tools/list dan menyertakan account_id saat generate.
+Idempotency key yang sama dengan akun/URL/tag berbeda ditolak, bukan mengembalikan
+hasil akun lain.
+
 ## MCP OpenClaw
 
 MCP memakai Streamable HTTP pada `/mcp` dengan Bearer token terpisah dari cookie
 webapp. Tool yang diekspos hanya queue dan pembacaan hasil:
 
-- `shopee_generate_short_links`: menerima 1–5 URL dan maksimal 5 tag; mendukung
+- `shopee_list_accounts`: daftar ID/nama akun dan kesiapan bridge, scope `jobs:read`.
+- `shopee_generate_short_links`: wajib `account_id` dari daftar akun; menerima 1–5 URL dan maksimal 5 tag; mendukung
   `idempotency_key` dan `wait_seconds`.
 - `shopee_get_job`: membaca satu job.
 - `shopee_wait_for_job`: polling bounded sampai terminal atau timeout.
@@ -213,6 +255,8 @@ python3 -m py_compile app.py
 node --check extension/content.js
 node --check extension/background.js
 git diff --check
+python3 -m unittest discover -s tests -v
+node --test tests/test_extension.cjs
 ```
 
 Periksa file yang akan masuk commit:
