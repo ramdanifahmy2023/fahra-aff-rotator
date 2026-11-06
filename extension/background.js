@@ -101,9 +101,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('fahra-bridge-wake', { periodInMinutes: 0.5 });
-});
+function ensureAlarm() {
+  // Chrome menolak alarm di bawah 1 menit. Tanpa alarm, service worker
+  // yang mati tidak bangun lagi dan bridge terlihat belum siap.
+  chrome.alarms.create('fahra-bridge-wake', { periodInMinutes: 1 });
+}
+chrome.runtime.onInstalled.addListener(ensureAlarm);
+chrome.runtime.onStartup.addListener(ensureAlarm);
+ensureAlarm();
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === 'fahra-bridge-wake') tick();
 });

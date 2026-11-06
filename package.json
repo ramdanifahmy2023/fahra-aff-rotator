@@ -4,7 +4,8 @@
   "description": "Webapp lokal dan worker durable untuk membuat custom link Shopee Affiliate dari satu sampai lima URL per job.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "python -m unittest discover -s tests -p test_*.py && node tests/theme.cjs",
+    "test:ui": "node tests/theme.cjs"
   },
   "keywords": [],
   "author": "",

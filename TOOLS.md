@@ -26,6 +26,46 @@ Fahra Affiliate Rotator.
 
 Jalankan dari root project:
 
+Windows memakai `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`.
+Untuk seed admin pertama, tambahkan `-BootstrapAdmin`; email dan password diminta
+interaktif tanpa password di history atau command line. Gunakan `MCP_HOST=127.0.0.1`
+di `.env` untuk penggunaan lokal. Log proses background lokal dapat disimpan di
+`data/server.stdout.log` dan `data/server.stderr.log` (diabaikan Git).
+
+Untuk startup sebelum login Windows, gunakan `install-runtime.ps1` dari PowerShell
+Administrator setelah mengisi `data/runtime-config.json` (lihat README). Task
+`Fahra-worker` dan `Fahra-tunnel` menjalankan `runtime_supervisor.py` sebagai Local
+Service, dengan trigger boot dan pemulihan setiap menit. `Fahra-Chrome` hanya
+berjalan saat login pengguna dan membuka profil di `open-affiliate-profiles.ps1`.
+`ensure-worker-health.ps1` mengembalikan izin penuh Local Service pada `app.py`
+dan file runtime bila hilang, lalu memastikan worker 8788 dan proses `python -m naira`
+hidup. Skrip itu dipanggil setiap menit oleh `Fahra-Profile-Repair`. Task
+`Fahra-Morning-Health` menjalankannya lagi pukul 06:40 supaya sebelum pukul 07:00
+worker dan bot sudah sehat. Chrome tidak ditutup dan tunnel tidak dinyalakan ulang.
+Pasang ulang task pagi dengan `ensure-worker-health.ps1 -Install`. Catatan ada di
+`data/runtime/health-repair.log`.
+Installer tidak mengganti password/login, database, atau kebijakan sleep.
+
+`status-runtime.ps1` menunjukkan task, timestamp watchdog, dan health bridge.
+Status/log ada di `data/runtime/{worker,tunnel}.{json,log}`; log berotasi 1 MiB
+dengan 5 backup. `ssh_running` hanya membuktikan proses SSH hidup. Uji dari VPS
+memakai `check_mcp.py` tetap diperlukan. Sebelum maintenance, disable task lalu
+stop task; stop saja akan dipulihkan oleh trigger satu menit. Simpan semua artefak
+runtime di luar Git.
+
+Regresi watchdog Windows (menggunakan server palsu di folder sementara, tidak
+menyentuh database produksi):
+
+```powershell
+python -m unittest discover -s tests -p test_supervisor.py -v
+```
+
+Test memverifikasi pemulihan setelah crash dan health gagal, single instance,
+serta penghentian proses anak ketika watchdog dihentikan. Status bridge offline
+tidak boleh memicu restart worker yang sehat.
+
+Pada macOS:
+
 ```sh
 ./start.sh
 ```

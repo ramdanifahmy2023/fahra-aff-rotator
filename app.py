@@ -18,7 +18,7 @@ import uuid
 from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPSConnection
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -815,32 +815,24 @@ def health_summary() -> dict[str, Any]:
 
 
 def probe_mcp_listener() -> dict[str, Any]:
-    parsed = urlparse(MCP_PUBLIC_URL)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return {"ok": False, "message": "MCP_PUBLIC_URL tidak valid."}
-    hostname = parsed.hostname
-    if hostname in {"0.0.0.0", "::", "[::]"}:
-        hostname = "127.0.0.1"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    path = parsed.path or "/mcp"
-    if parsed.query:
-        path += f"?{parsed.query}"
-    connection_class = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    # The client URL can point to the VPS end of a reverse SSH tunnel.
+    # A dashboard check verifies this process's listener, not remote reachability.
+    hostname = "127.0.0.1" if MCP_HOST in {"0.0.0.0", "::"} else MCP_HOST
     connection = None
     try:
-        connection = connection_class(hostname, port, timeout=3)
+        connection = HTTPConnection(hostname, MCP_PORT, timeout=3)
         connection.request(
             "POST",
-            path,
+            "/mcp",
             body=b'{"jsonrpc":"2.0","id":"dashboard-probe","method":"initialize","params":{}}',
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         response = connection.getresponse()
         response.read(4096)
         if response.status == HTTPStatus.UNAUTHORIZED:
-            return {"ok": True, "status": response.status, "message": "MCP aktif dan meminta Bearer token."}
+            return {"ok": True, "scope": "local", "status": response.status, "message": "Listener MCP Windows aktif dan meminta Bearer token. Koneksi VPS perlu diuji dari VPS."}
         if response.status == HTTPStatus.OK:
-            return {"ok": True, "status": response.status, "message": "MCP aktif dan endpoint merespons."}
+            return {"ok": False, "scope": "local", "status": response.status, "message": "Listener merespons tanpa autentikasi. Periksa konfigurasi MCP."}
         return {"ok": False, "status": response.status, "message": f"Endpoint MCP merespons HTTP {response.status}."}
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": f"MCP tidak terjangkau: {str(exc)[:160]}"}
@@ -1312,14 +1304,31 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def read_json(self) -> Any:
+        if getattr(self, "_body_consumed", False):
+            return self._json_body
         length = int(self.headers.get("Content-Length", "0"))
         if length > 2_000_000:
             raise ValueError("Request terlalu besar")
-        return json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length) if length else b"{}"
+        self._body_consumed = True
+        self._json_body = json.loads(raw or b"{}")
+        return self._json_body
+
+    def discard_body(self) -> None:
+        if getattr(self, "_body_consumed", False):
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 2_000_000:
+            length = 2_000_000
+        if length:
+            self.rfile.read(length)
+        self._body_consumed = True
 
     def require_user(self) -> sqlite3.Row | None:
         user = current_user(self)
         if not user:
+            # Windows resets a POST connection if the body is still unread when the socket closes.
+            self.discard_body()
             self.send_json({"error": "Login diperlukan"}, HTTPStatus.UNAUTHORIZED)
         return user
 
@@ -1332,12 +1341,15 @@ class Handler(BaseHTTPRequestHandler):
         if origin:
             parsed_origin = urlparse(origin)
             if parsed_origin.netloc.lower() != host.lower() or parsed_origin.scheme not in {"http", "https"}:
+                self.discard_body()
                 self.send_json({"error": "Origin request tidak cocok"}, HTTPStatus.FORBIDDEN)
                 return None
         elif self.headers.get("Sec-Fetch-Site", "").lower() not in {"same-origin", "none", ""}:
+            self.discard_body()
             self.send_json({"error": "Request lintas origin ditolak"}, HTTPStatus.FORBIDDEN)
             return None
         if user["must_change_password"]:
+            self.discard_body()
             self.send_json({"error": "Ganti password terlebih dahulu"}, HTTPStatus.FORBIDDEN)
             return None
         return user
@@ -1544,6 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             return
         if user["must_change_password"]:
+            self.discard_body()
             self.send_json({"error": "Ganti password terlebih dahulu"}, HTTPStatus.FORBIDDEN)
             return
         try:

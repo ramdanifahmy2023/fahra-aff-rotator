@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-06
+
+### Added
+
+- `ensure-worker-health.ps1` memulihkan izin Local Service yang hilang dan
+  menyalakan kembali worker serta bot Naira yang mati. Pemulihan profil
+  memanggilnya setiap menit. Task `Fahra-Morning-Health` mengulang pemeriksaan
+  pukul 06:40 supaya layanan sudah sehat sebelum pukul 07:00.
+
+### Fixed
+
+- Bilah alamat Chrome yang menyembunyikan skema `http`/`https` tetap dikenali
+  sebagai Custom Link dan halaman login dashboard. Sukses login dihitung saat
+  halaman menjadi `/#dashboard`. Pemulihan lalu menutup tab login yang tertinggal.
+
 ## 2026-11-02
 
 ### Added
@@ -34,6 +49,35 @@
   dashboard lokal, lalu isi nama akun lewat ikon extension. Client MCP perlu
   memuat ulang tools/list dan menyertakan account_id. Nama akun masih label manual;
   gunakan satu profil tetap per akun Shopee. Eksekusi paralel belum tersedia.
+
+## 2026-10-20
+
+### Fixed
+
+- Memperbaiki switch tema dengan menghentikan reset dropdown pada setiap polling
+  dashboard. Login dan dashboard kini memakai pengaturan tema bersama, menyimpan
+  pilihan, mengikuti OS pada mode Sistem, dan menyinkronkan perubahan antar-tab.
+- Memisahkan warna navigasi, tombol, dan teks kartu agar tema terang/gelap tetap
+  terbaca; kontrol native pada kartu terang memakai color-scheme yang sesuai.
+- Menguji listener MCP lokal terpisah dari URL client, sehingga endpoint VPS pada
+  reverse SSH tunnel tidak menyebabkan hasil tes dashboard yang menyesatkan.
+
+### Added
+
+- Menambahkan watchdog Windows untuk pemulihan worker/gateway MCP dan SSH tunnel,
+  health check, single instance, penghentian proses anak melalui Job Object,
+  status JSON, dan log berotasi. Menambahkan installer Task Scheduler dengan
+  akun Local Service, trigger boot/recovery, serta pemulihan profil Chrome saat
+  login; menyertakan regresi crash dan health failure tanpa data produksi.
+- Menampilkan endpoint client pada panel MCP, menambahkan contoh Codex dengan
+  timeout tool 240 detik, launcher reverse SSH tunnel dengan reconnect, serta
+  pemeriksaan MCP dari VPS tanpa mencetak credential.
+- Menambahkan regresi browser untuk tema, kontras, dan layout; serta test integrasi
+  MCP untuk handshake, tool discovery, token yang dicabut, dan tes listener lokal.
+- Menambahkan launcher Windows `start.ps1` yang memuat `.env`, mendeteksi server
+  yang sudah berjalan, dan menyediakan bootstrap admin dengan input password
+  tersembunyi tanpa menimpa akun yang sudah ada.
+- Mendokumentasikan startup PowerShell dan konfigurasi MCP lokal di Windows.
 
 ## 2026-09-27
 
